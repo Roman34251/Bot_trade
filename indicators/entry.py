@@ -15,11 +15,7 @@
 import pandas as pd
 import numpy as np
 
-try:
-    import pandas_ta as ta
-    HAS_PANDAS_TA = True
-except ImportError:
-    HAS_PANDAS_TA = False
+
 
 
 def _stoch_manual(high: pd.Series, low: pd.Series, close: pd.Series,
@@ -58,21 +54,20 @@ def stochastic_signal(df: pd.DataFrame,
         return {"k": 50.0, "d": 50.0, "oversold": False,
                 "overbought": False, "bullish_cross": False, "bearish_cross": False}
 
-    if HAS_PANDAS_TA:
-        stoch  = ta.stoch(df['high'], df['low'], df['close'],
-                          k=k, d=d, smooth_k=smooth_k)
-        k_col  = f'STOCHk_{k}_{d}_{smooth_k}'
-        d_col  = f'STOCHd_{k}_{d}_{smooth_k}'
-        k_val  = float(stoch[k_col].iloc[-1])
-        d_val  = float(stoch[d_col].iloc[-1])
-        k_prev = float(stoch[k_col].iloc[-2])
-        d_prev = float(stoch[d_col].iloc[-2])
-    else:
-        st     = _stoch_manual(df['high'], df['low'], df['close'], k, d, smooth_k)
-        k_val  = float(st["k"].iloc[-1])
-        d_val  = float(st["d"].iloc[-1])
-        k_prev = float(st["k"].iloc[-2])
-        d_prev = float(st["d"].iloc[-2])
+    st = _stoch_manual(
+    df['high'],
+    df['low'],
+    df['close'],
+    k,
+    d,
+    smooth_k
+    )
+
+    k_val = float(st["k"].iloc[-1])
+    d_val = float(st["d"].iloc[-1])
+
+    k_prev = float(st["k"].iloc[-2])
+    d_prev = float(st["d"].iloc[-2])
 
     # NaN перевірка
     if any(pd.isna(v) for v in [k_val, d_val, k_prev, d_prev]):

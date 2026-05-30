@@ -12,11 +12,7 @@
 import pandas as pd
 import numpy as np
 
-try:
-    import pandas_ta as ta
-    HAS_PANDAS_TA = True
-except ImportError:
-    HAS_PANDAS_TA = False
+
 
 
 # ── Fallback реалізації якщо pandas_ta не встановлено ─────
@@ -77,10 +73,12 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
         # Недостатньо даних — повертаємо простий range
         return float((df['high'] - df['low']).mean())
 
-    if HAS_PANDAS_TA:
-        atr_series = ta.atr(df['high'], df['low'], df['close'], length=period)
-    else:
-        atr_series = _atr_manual(df['high'], df['low'], df['close'], period)
+    atr_series = _atr_manual(
+        df['high'],
+        df['low'],
+        df['close'],
+        period
+    )
 
     val = atr_series.iloc[-1]
     return float(val) if not pd.isna(val) else float((df['high'] - df['low']).mean())
@@ -102,16 +100,15 @@ def detect_bb_squeeze(df: pd.DataFrame,
         return {"is_squeeze": False, "width_pct": 999.0,
                 "upper": 0.0, "lower": 0.0, "mid": 0.0}
 
-    if HAS_PANDAS_TA:
-        bb    = ta.bbands(df['close'], length=length, std=std)
-        upper = float(bb[f'BBU_{length}_{std}'].iloc[-1])
-        lower = float(bb[f'BBL_{length}_{std}'].iloc[-1])
-        mid   = float(bb[f'BBM_{length}_{std}'].iloc[-1])
-    else:
-        bb    = _bbands_manual(df['close'], length, std)
-        upper = float(bb["upper"].iloc[-1])
-        lower = float(bb["lower"].iloc[-1])
-        mid   = float(bb["mid"].iloc[-1])
+    bb = _bbands_manual(
+        df['close'],
+        length,
+        std
+    )
+
+    upper = float(bb["upper"].iloc[-1])
+    lower = float(bb["lower"].iloc[-1])
+    mid = float(bb["mid"].iloc[-1])
 
     if mid == 0 or pd.isna(mid):
         return {"is_squeeze": False, "width_pct": 999.0,

@@ -13,7 +13,7 @@ import pandas as pd
 from loguru import logger
 
 from indicators.range_detector import detect_range, calculate_atr
-from indicators.entry_signals import (
+from indicators.entry import (
     stochastic_signal, calculate_cvd, cvd_reversal,
     order_flow_delta, volume_on_deviation,
     detect_bos, calculate_levels,
