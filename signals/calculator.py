@@ -197,4 +197,4 @@ def check_daily_limits(
         "daily_pnl": daily_pnl,
         "trade_count": trade_count,
         "loss_streak": loss_streak,
-    }
+     }
