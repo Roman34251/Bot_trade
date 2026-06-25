@@ -1,0 +1,65 @@
+2026-06-05 09:56:59 | INFO     | 🟡 Запуск в DEMO режимі (api-demo.bybit.com)
+2026-06-05 09:56:59 | INFO     |    Переконайся що BYBIT_DEMO=true в .env
+2026-06-05 09:56:59 | INFO     |    Зупинити: Ctrl+C
+
+2026-06-05 09:57:00 | INFO     | ⚠️  Demo endpoint: api-demo.bybit.com
+2026-06-05 09:57:00 | ERROR    | ❌ Помилка підключення: _V5HTTPManager.__init__() got an unexpected keyword argument 'proxy'
+2026-06-05 09:57:38 | INFO     | 🟡 Запуск в DEMO режимі (api-demo.bybit.com)
+2026-06-05 09:57:38 | INFO     |    Переконайся що BYBIT_DEMO=true в .env
+2026-06-05 09:57:38 | INFO     |    Зупинити: Ctrl+C
+
+2026-06-05 09:57:39 | INFO     | ⚠️  Demo endpoint: api-demo.bybit.com
+2026-06-05 09:57:39 | ERROR    | ❌ Помилка підключення: _V5HTTPManager.__init__() got an unexpected keyword argument 'proxy'
+2026-06-05 09:58:37 | INFO     | 🟡 Запуск в DEMO режимі (api-demo.bybit.com)
+2026-06-05 09:58:37 | INFO     |    Переконайся що BYBIT_DEMO=true в .env
+2026-06-05 09:58:37 | INFO     |    Зупинити: Ctrl+C
+
+2026-06-05 09:58:38 | INFO     | ⚠️  Demo endpoint: api-demo.bybit.com
+2026-06-05 09:58:38 | ERROR    | ❌ Помилка підключення: _V5HTTPManager.__init__() got an unexpected keyword argument 'proxy'
+2026-06-05 10:07:41 | INFO     | 🟡 Запуск в DEMO режимі (api-demo.bybit.com)
+2026-06-05 10:07:41 | INFO     |    Переконайся що BYBIT_DEMO=true в .env
+2026-06-05 10:07:41 | INFO     |    Зупинити: Ctrl+C
+
+2026-06-05 10:07:42 | INFO     | ⚠️  Demo endpoint: api-demo.bybit.com
+2026-06-05 10:07:43 | INFO     | ✅ Bybit підключено | USDT баланс: $50000.00
+2026-06-05 10:07:43 | INFO     | 🤖 LiveTrader запущено | режим=DEMO
+2026-06-05 10:07:43 | INFO     |    Депозит: $500.0 | Ризик: 1.0%/угоду
+2026-06-05 10:07:43 | INFO     |    Пари: ['BTC/USDT:USDT']
+2026-06-05 10:07:43 | WARNING  | ⚠️ WS private fetch_markets: 'public'
+2026-06-05 10:07:43 | INFO     | 📊 Завантаження початкових свічок...
+2026-06-05 10:07:50 | INFO     |    BTC/USDT:USDT 1h: 200 свічок
+2026-06-05 10:07:50 | INFO     |    BTC/USDT:USDT 30m: 200 свічок
+2026-06-05 10:07:50 | INFO     |    BTC/USDT:USDT 5m: 200 свічок
+2026-06-05 10:07:50 | INFO     |    BTC/USDT:USDT 1m: 200 свічок
+2026-06-05 10:07:50 | INFO     | ✅ Початкові свічки завантажено
+2026-06-05 10:07:50 | INFO     | ▶ Всі потоки запущено
+2026-06-05 10:07:51 | INFO     | 📡 Order book WebSocket: BTC/USDT:USDT
+2026-06-05 10:07:51 | INFO     | 📡 Candles WebSocket: BTC/USDT:USDT 1m
+2026-06-05 10:07:51 | INFO     | 🔄 Торговий цикл запущено
+2026-06-05 10:07:51 | DEBUG    | Рейндж оновлено | 1h=False 30m=False
+2026-06-05 10:07:51 | DEBUG    | BTC/USDT:USDT: немає рейнджу (BB не стиснутий)
+2026-06-05 10:07:51 | DEBUG    | BTC/USDT:USDT [30m]: немає рейнджу на 30m
+2026-06-05 10:07:51 | INFO     | ✅ Candles WebSocket підключено: BTC/USDT:USDT 1m
+2026-06-05 10:07:51 | INFO     | ✅ OB WebSocket підключено: BTC/USDT:USDT
+2026-06-05 10:08:06 | DEBUG    | BTC/USDT:USDT: немає рейнджу (BB не стиснутий)
+2026-06-05 10:08:06 | DEBUG    | BTC/USDT:USDT [30m]: немає рейнджу на 30m
+2026-06-05 10:08:21 | DEBUG    | BTC/USDT:USDT: немає рейнджу (BB не стиснутий)
+2026-06-05 10:08:21 | DEBUG    | BTC/USDT:USDT [30m]: немає рейнджу на 30m
+2026-06-05 10:08:22 | WARNING  | OB WebSocket помилка BTC/USDT:USDT:  — перепідключення...
+2026-06-05 10:08:25 | INFO     | ✅ OB WebSocket підключено: BTC/USDT:USDT
+2026-06-05 10:08:36 | DEBUG    | BTC/USDT:USDT: немає рейнджу (BB не стиснутий)
+2026-06-05 10:08:36 | DEBUG    | BTC/USDT:USDT [30m]: немає рейнджу на 30m
+2026-06-05 10:08:51 | DEBUG    | BTC/USDT:USDT: немає рейнджу (BB не стиснутий)
+2026-06-05 10:08:51 | DEBUG    | BTC/USDT:USDT [30m]: немає рейнджу на 30m
+2026-06-05 10:08:56 | WARNING  | OB WebSocket помилка BTC/USDT:USDT:  — перепідключення...
+2026-06-05 10:08:59 | INFO     | ✅ OB WebSocket підключено: BTC/USDT:USDT
+2026-06-05 10:09:06 | DEBUG    | BTC/USDT:USDT: немає рейнджу (BB не стиснутий)
+2026-06-05 10:09:06 | DEBUG    | BTC/USDT:USDT [30m]: немає рейнджу на 30m
+2026-06-05 10:09:21 | DEBUG    | BTC/USDT:USDT: немає рейнджу (BB не стиснутий)
+2026-06-05 10:09:21 | DEBUG    | BTC/USDT:USDT [30m]: немає рейнджу на 30m
+2026-06-05 10:09:22 | WARNING  | Candles WebSocket помилка BTC/USDT:USDT 1m: 
+2026-06-05 10:09:25 | INFO     | ✅ Candles WebSocket підключено: BTC/USDT:USDT 1m
+2026-06-05 10:09:30 | WARNING  | OB WebSocket помилка BTC/USDT:USDT:  — перепідключення...
+2026-06-05 10:09:33 | INFO     | ✅ OB WebSocket підключено: BTC/USDT:USDT
+2026-06-05 10:09:36 | DEBUG    | BTC/USDT:USDT: немає рейнджу (BB не стиснутий)
+2026-06-05 10:09:36 | DEBUG    | BTC/USDT:USDT [30m]: немає рейнджу на 30m
