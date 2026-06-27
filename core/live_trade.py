@@ -166,6 +166,11 @@ class LiveTrader:
         self.market = self._connect_market_rest()
         self.ws     = None
 
+        # Опційний нотифаєр (Telegram). telegrambot.py виставляє
+        # trader.notifier = tg_bot. Якщо None — трейдер працює мовчки.
+        # Усі виклики йдуть через self._notify() і НІКОЛИ не ламають торгівлю.
+        self.notifier = None
+
         self.state = LiveState(
             equity  = Decimal(str(self._real_balance)),
             deposit = Decimal(str(self._real_balance)),
@@ -804,11 +809,19 @@ class LiveTrader:
                 "range_low":   signal.get("range", {}).get("low"),
                 "bias_1h":     signal.get("bias_1h"),
                 "of_delta":    signal.get("of_delta"),
+                # Поля нових стратегій (None для sweep) — для Telegram-звіту
+                "rsi":          signal.get("rsi"),
+                "bb_percent_b": signal.get("bb_percent_b"),
+                "bb_width_pct": signal.get("bb_width_pct"),
+                "vwap_dev_pct": signal.get("vwap_dev_pct"),
             }
 
             self.state.open_trade      = trade_record
             self.state.last_trade_time = datetime.now(timezone.utc)
             self.state.daily_trades   += 1
+
+            # Push-сповіщення в Telegram (безпечне; нема нотифаєра → no-op)
+            await self._notify("notify_trade_opened", trade_record)
 
             # TODO: log_trade_open(trade_record)  ← підключимо в наступному кроці
 
@@ -868,6 +881,9 @@ class LiveTrader:
             else:
                 self.state.loss_streak = 0
 
+            # Push-сповіщення про закриття (безпечне; нема нотифаєра → no-op)
+            await self._notify("notify_trade_closed", float(pnl), trade)
+
             # TODO: log_trade_close(trade["order_id"], pnl, result)
 
             self.state.open_trade = None
@@ -877,6 +893,22 @@ class LiveTrader:
             self.state.open_trade = None
 
     # ── Допоміжні методи ──────────────────────────────────────
+
+    async def _notify(self, method: str, *args) -> None:
+        """
+        Безпечний виклик нотифаєра (Telegram). Якщо нотифаєра нема або
+        метод відсутній/кинув виняток — торгівля НЕ страждає.
+        """
+        n = self.notifier
+        if n is None:
+            return
+        fn = getattr(n, method, None)
+        if fn is None:
+            return
+        try:
+            await fn(*args)
+        except Exception as e:
+            logger.warning(f"Notifier {method} помилка: {e}")
 
     def _get_df(self, symbol: str, tf: str) -> pd.DataFrame | None:
         key = f"{symbol}_{tf}"
@@ -890,6 +922,10 @@ class LiveTrader:
         )
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         df.set_index("timestamp", inplace=True)
+        # Дедуплікація: REST-початкові свічки і WS-confirm можуть дати
+        # дубль останнього timestamp (forming vs closed). Лишаємо останній —
+        # інакше BB/RSI/VWAP рахуються по «зайвій» свічці.
+        df = df[~df.index.duplicated(keep="last")]
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = df[col].astype(float)
         return df

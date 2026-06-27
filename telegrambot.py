@@ -192,6 +192,31 @@ def fmt_pct_distance(target: Any, entry: Any) -> str:
         return "n/a"
 
 
+def fmt_filters(t: dict) -> list[str]:
+    """
+    Рядки 'фільтрів входу' залежно від стратегії угоди.
+    Для sweep — OF/CVD/Volume/OB. Для meanrev — RSI/BB. Для vwap — VWAP/RSI.
+    Так звіт не показує 'n/a' там, де фільтр просто не застосовується.
+    """
+    strat = (t.get("strategy") or t.get("mode") or "").lower()
+    if strat == "meanrev":
+        return [
+            f"  RSI: `{fmt_num(t.get('rsi'), 1)}`",
+            f"  BB %b: `{fmt_num(t.get('bb_percent_b'), 2)}` | ширина: `{fmt_num(t.get('bb_width_pct'), 2)}%`",
+        ]
+    if strat == "vwap":
+        return [
+            f"  VWAP дев.: `{fmt_num(t.get('vwap_dev_pct'), 2, signed=True)}%`",
+            f"  RSI: `{fmt_num(t.get('rsi'), 1)}`",
+        ]
+    return [
+        f"  OF delta: `{fmt_num(t.get('of_delta'), 0, signed=True)}`",
+        f"  CVD: `{t.get('cvd_signal', 'n/a')}` | ok: {fmt_bool(t.get('cvd_ok'))}",
+        f"  Volume ok: {fmt_bool(t.get('volume_ok'))}",
+        f"  OB: `{fmt_ob(t.get('ob_imbalance'))}` | confirmed: {fmt_bool(t.get('ob_confirmed'))}",
+    ]
+
+
 def fmt_trader_state(trader: LiveTrader) -> str:
     """
     Коректний стан:
@@ -240,13 +265,10 @@ def fmt_status(trader: LiveTrader) -> str:
             f"  R:R: `{fmt_num(t.get('raw_rr'), 2)}`",
             f"  Ризик: `${fmt_num(t.get('risk_usdt'), 2)}` → Мета: `${fmt_num(t.get('reward_usdt'), 2)}`",
             "",
+            f"*Стратегія: `{t.get('strategy', t.get('mode', '?'))}`*",
             "*Фільтри входу:*",
-            f"  OF delta: `{fmt_num(t.get('of_delta'), 0, signed=True)}`",
-            f"  CVD: `{t.get('cvd_signal', 'n/a')}` | ok: {fmt_bool(t.get('cvd_ok'))}",
-            f"  Volume ok: {fmt_bool(t.get('volume_ok'))}",
-            f"  OB: `{fmt_ob(t.get('ob_imbalance'))}` | confirmed: {fmt_bool(t.get('ob_confirmed'))}",
+            *fmt_filters(t),
             "",
-            f"  Сесія: `{t.get('session', '?')}` | Режим: `{t.get('mode', '?')}`",
             f"  Відкрита: `{mins} хв тому`",
         ]
     else:
@@ -313,15 +335,10 @@ def fmt_position(trader: LiveTrader) -> str:
         f"Ризик:  `${fmt_num(t.get('risk_usdt'), 2)}`",
         f"Мета:   `${fmt_num(t.get('reward_usdt'), 2)}`",
         "",
+        f"*Стратегія: `{t.get('strategy', t.get('mode', '?'))}`*",
         "*Фільтри входу:*",
-        f"OF delta: `{fmt_num(t.get('of_delta'), 0, signed=True)}`",
-        f"CVD: `{t.get('cvd_signal', 'n/a')}` | ok: {fmt_bool(t.get('cvd_ok'))}",
-        f"Volume ok: {fmt_bool(t.get('volume_ok'))}",
-        f"OB imbalance: `{fmt_ob(t.get('ob_imbalance'))}`",
-        f"OB confirmed: {fmt_bool(t.get('ob_confirmed'))}",
+        *fmt_filters(t),
         "",
-        f"Сесія: `{t.get('session', '?')}`",
-        f"Режим: `{t.get('mode', '?')}`",
         f"Відкрита: `{mins} хв тому`",
         f"ID: `{t.get('order_id', '?')}`",
     ])
@@ -576,20 +593,18 @@ class TradingBot:
 
     async def notify_trade_opened(self, signal: dict) -> None:
         direction_emoji = "🟢" if signal["direction"] == "long" else "🔴"
+        strat = signal.get("strategy", signal.get("mode", "unknown"))
+        filters = "\n".join(line.strip() for line in fmt_filters(signal))
 
         await self.send_alert(
             f"{direction_emoji} *ВІДКРИТО УГОДУ*\n\n"
             f"`{signal['symbol']}` {signal['direction'].upper()}\n"
-            f"Mode: `{signal.get('mode', 'unknown')}`\n\n"
+            f"Стратегія: `{strat}`\n\n"
             f"Entry: `{fmt_price(signal.get('entry'), 4)}`\n"
             f"TP:    `{fmt_price(signal.get('tp'), 4)}`\n"
             f"SL:    `{fmt_price(signal.get('sl'), 4)}`\n"
             f"R:R:   `{fmt_num(signal.get('raw_rr'), 2)}`\n\n"
-            f"*Фільтри:*\n"
-            f"OF delta: `{fmt_num(signal.get('of_delta'), 0, signed=True)}`\n"
-            f"CVD: `{signal.get('cvd_signal', 'n/a')}` | ok: {fmt_bool(signal.get('cvd_ok'))}\n"
-            f"Volume ok: {fmt_bool(signal.get('volume_ok'))}\n"
-            f"OB: `{fmt_ob(signal.get('ob_imbalance'))}` | confirmed: {fmt_bool(signal.get('ob_confirmed'))}"
+            f"*Фільтри:*\n{filters}"
         )
 
     async def notify_trade_closed(self, pnl: float, trade: dict) -> None:
@@ -640,6 +655,10 @@ async def run_bot_with_trader(mode: str = "demo") -> None:
     token, admin_id = _load_tg_config()
     trader = LiveTrader()
     tg_bot = TradingBot(token=token, admin_id=admin_id, trader=trader)
+
+    # ВАЖЛИВО: даємо трейдеру посилання на нотифаєр, інакше push-алерти
+    # (відкриття/закриття угоди) НЕ надсилаються — вони саме тут і вмикаються.
+    trader.notifier = tg_bot
 
     # Відправляємо стартове повідомлення
     if admin_id:
