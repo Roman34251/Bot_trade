@@ -60,9 +60,15 @@ def calculate_position(
     entry_price: Decimal,
     stop_loss:   Decimal,
     take_profit: Decimal,
+    min_rr:      Decimal | None = None,
 ) -> dict:
     """
     Розраховує розмір позиції і реальний P&L з комісіями.
+
+    min_rr — поріг NET RR для цієї КОНКРЕТНОЇ угоди. Кожна стратегія має
+    свій профіль: sweep/breakout очікує RR≥1.5, а mean-reversion свідомо
+    торгує з RR≈0.8-1.0 але високим win-rate. Якщо None — береться
+    глобальний MIN_RR (= settings.MIN_RISK_REWARD).
 
     Алгоритм:
       1. risk_usdt = deposit × risk_pct          ($500 × 1% = $5)
@@ -81,6 +87,7 @@ def calculate_position(
     cfg      = SYMBOL_CFG[symbol]
     slip     = SLIPPAGE[symbol]
     risk_usd = deposit * risk_pct
+    rr_floor = Decimal(str(min_rr)) if min_rr is not None else MIN_RR
 
     sl_dist = abs(entry_price - stop_loss)
     if sl_dist == 0:
@@ -147,7 +154,8 @@ def calculate_position(
         "risk_usdt":       net_loss.quantize(Decimal("0.01")),
         "reward_usdt":     net_profit.quantize(Decimal("0.01")),
         "rr_ratio":        rr.quantize(Decimal("0.01")),
-        "rr_ok":           rr >= MIN_RR,
+        "rr_ok":           rr >= rr_floor,
+        "rr_floor":        rr_floor,
         "breakeven_move":  breakeven_price.quantize(Decimal("0.01")),
         "order_type":      "MARKET",
     }
@@ -155,7 +163,7 @@ def calculate_position(
     logger.debug(
         f"Position {symbol}: qty={quantity} pos=${pos_value:.2f} | "
         f"risk=${net_loss:.2f} reward=${net_profit:.2f} RR={rr:.2f} "
-        f"{'✅' if rr >= MIN_RR else '❌'}"
+        f"(floor {rr_floor}) {'✅' if rr >= rr_floor else '❌'}"
     )
 
     return result
@@ -197,4 +205,4 @@ def check_daily_limits(
         "daily_pnl": daily_pnl,
         "trade_count": trade_count,
         "loss_streak": loss_streak,
-     }
+    }

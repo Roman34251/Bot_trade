@@ -41,7 +41,7 @@ SYMBOL_CONFIG = {
         # (calculator.calculate_position) окремо рахує NET RR після комісій
         # і порівнює з MIN_RISK_REWARD. На BTC round-trip комісія+сліпедж
         # ~0.17% notional, тож gross мусить мати запас (див. розрахунок нижче).
-        "min_rr":             2.0,
+        "min_rr":             2.5,
 
         # Мінімальна дистанція SL у % від ціни. Захищає від двох речей одразу:
         #   1) комісія (0.17%) з'їдає угоду з надто тісним стопом
@@ -50,9 +50,17 @@ SYMBOL_CONFIG = {
         # None → береться глобальний MIN_SL_DISTANCE_PCT.
         "min_sl_distance_pct": 0.005,  # ~0.5% (≈$475 на BTC ~95k)
 
-        # ── Order Flow — основний підтверджуючий фільтр
+        # ── Sweep як STATE, а не миттєвий збіг ──────────────────
+        # Раніше sweep+BOS+order-flow мали збігтись на ОДНІЙ останній 1m
+        # свічці одночасно → майже ніколи не траплялось → 0 угод.
+        # Тепер sweep — це "setup", що живе sweep_window свічок; вхід
+        # потребує reclaim + МІНІМУМ min_confirmations підтверджень.
+        "sweep_window":        12,    # скільки 1m свічок sweep лишається валідним
+        "min_confirmations":   1,     # скільки з (BOS / order-flow / momentum) треба
+
+        # ── Order Flow — тепер М'ЯКЕ підтвердження (не hard-filter) ──
         "order_flow_lookback": 3,
-        "use_order_flow_filter": True,
+        "use_order_flow_filter": False,   # було True → різало половину сигналів
 
         # ── CVD / Volume — тимчасово НЕ блокують сигнал
         "use_cvd_filter":     False,
@@ -65,9 +73,79 @@ SYMBOL_CONFIG = {
         "cvd_lookback":       3,
         "volume_mult":        1.05,
         "volume_lookback":    20,
+
+        # Власний поріг RR для sweep (gross, до комісій). Широкий 1h-range
+        # дає велику ціль → RR високий, тримаємо запас на комісії.
+        "min_rr":             1.6,
+
+        # ════════════════════════════════════════════════════════
+        # СТРАТЕГІЯ B — Mean-Reversion (Bollinger Bands + RSI)
+        # Окрема, незалежна стратегія. Працює в боковику: ціна
+        # торкається смуги BB + RSI в екстремумі → вхід на повернення
+        # до середини каналу (SMA20). Дає БАГАТО угод.
+        # ════════════════════════════════════════════════════════
+        "meanrev": {
+            "enabled":        True,
+            "tf":             "5m",    # сигнальний ТФ (ширші смуги → TP покриває комісії)
+            "bb_period":      20,
+            "bb_std":         2.0,
+            "rsi_period":     14,
+            "rsi_oversold":   35,      # м'якше за класичні 30 → більше сигналів
+            "rsi_overbought": 65,      # м'якше за класичні 70
+            "require_rsi":    True,    # BB-торкання має підтверджуватись RSI
+            "tp_target":      "mid",   # ціль = середня смуга BB (= середнє)
+            "sl_atr_buffer":  0.5,     # SL за смугою + 0.5·ATR
+            "min_width_pct":  0.30,    # ігнорувати надто вузький канал (TP < комісій)
+            "use_adx_filter": False,   # поки вимкнено → більше угод; вмикати при тюнінгу
+            "adx_max":        35,      # якщо use_adx_filter: пропускати при ADX>35 (тренд)
+            "min_sl_pct":     0.0018,  # ВЛАСНИЙ мін. SL (захист маржі), НЕ глобальний 0.5%
+            # min_rr НИЗЬКИЙ свідомо: mean-reversion = високий win-rate / низький RR.
+            # При маркет-ордерах і комісії ~0.17% net RR виходить ≈0.5-0.8.
+            # Це стартове значення «РОЗТОРГУВАТИ + зібрати статистику на demo».
+            # Підняти win-rate далі: maker/limit входи, ТФ 15m, суворіший RSI/ADX.
+            "min_rr":         0.5,
+        },
+
+        # ════════════════════════════════════════════════════════
+        # СТРАТЕГІЯ C — VWAP σ-band reversion
+        # Окрема, незалежна стратегія. Ціна відходить на k·σ від VWAP
+        # → вхід на повернення до VWAP (інституційний бенчмарк).
+        # ════════════════════════════════════════════════════════
+        "vwap": {
+            "enabled":        True,
+            "tf":             "5m",
+            "window":         96,      # ковзний VWAP ≈ 8h на 5m (стабільніше за сесійний)
+            "k_band":         2.0,     # вхід коли ціна за межами VWAP±2σ
+            "require_rsi":    False,   # VWAP-девіації достатньо; RSI лише як бонус
+            "rsi_period":     14,
+            "rsi_oversold":   42,      # дуже м'яко (майже не блокує)
+            "rsi_overbought": 58,
+            "sl_k":           3.5,     # SL на рівні VWAP±3.5σ (за межею входу)
+            "tp_target":      "vwap",  # ціль = сам VWAP
+            "min_dev_pct":    0.20,    # мін. девіація від VWAP (інакше TP < комісій)
+            "min_sl_pct":     0.002,   # власний мін. SL (захист маржі)
+            "min_rr":         0.6,     # VWAP-девіація дає кращий RR за BB; поріг вищий
+        },
     }
 
 }
+
+
+# ═══════════════════════════════════════════════════════════════
+# STRATEGY SELECTION — які стратегії активні і в якому порядку
+# ═══════════════════════════════════════════════════════════════
+
+# Майстер-перемикачі (env може вимкнути будь-яку без зміни коду).
+USE_SWEEP_STRATEGY   = os.getenv("USE_SWEEP_STRATEGY",   "true").lower() == "true"
+USE_MEANREV_STRATEGY = os.getenv("USE_MEANREV_STRATEGY", "true").lower() == "true"
+USE_VWAP_STRATEGY    = os.getenv("USE_VWAP_STRATEGY",    "true").lower() == "true"
+
+# Порядок перевірки в live_trade._check_signal. Перша стратегія, що дала
+# валідний сигнал — виконується. Mean-reversion першою, бо дає найбільше
+# угод (мета зараз — РОЗТОРГУВАТИ бота і зібрати статистику).
+STRATEGY_PRIORITY = os.getenv(
+    "STRATEGY_PRIORITY", "meanrev,vwap,sweep"
+).split(",")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -179,11 +257,14 @@ TREND_RESUME_WAIT_CANDLES  = int(os.getenv("TREND_RESUME_WAIT_CANDLES",    5))
 # DEVIATION
 # ═══════════════════════════════════════════════════════════════
 
+# Основний множник ATR для порогу девіації
+# dual_df.py: low < range_low - atr × DEVIATION_ATR_MULT = devіація вниз
 DEVIATION_ATR_MULT         = float(os.getenv("DEVIATION_ATR_MULT",      0.3))
 DEVIATION_VOLUME_LOOKBACK  = int(os.getenv("DEVIATION_VOLUME_LOOKBACK", 20))
 DEVIATION_VOLUME_MAX_RATIO = float(os.getenv("DEVIATION_VOLUME_MAX_RATIO", 1.5))
 MAX_DEVIATION_AGE_MIN      = int(os.getenv("MAX_DEVIATION_AGE_MIN",     180))
 
+# Сумісність зі старим кодом
 DEVIATION_VOLUME_MODE      = os.getenv("DEVIATION_VOLUME_MODE", "weak")
 WEAK_BREAKOUT_VOLUME_MAX   = float(os.getenv("WEAK_BREAKOUT_VOLUME_MAX", 1.5))
 CLIMAX_VOLUME_MIN          = float(os.getenv("CLIMAX_VOLUME_MIN",        2.0))
@@ -202,8 +283,13 @@ ATR_PERIOD_FAST = int(os.getenv("ATR_PERIOD_FAST",  7))
 # STRATEGY SWITCHES
 # ═══════════════════════════════════════════════════════════════
 
+# dual_tf тимчасово вимикаємо, бо будемо змінювати стратегію
 USE_DUAL_TF_STRATEGY = os.getenv("USE_DUAL_TF_STRATEGY", "false").lower() == "true"
+
+# Order Book робимо не обов'язковим direction-фільтром
 USE_ORDER_BOOK_CONFIRMATION = os.getenv("USE_ORDER_BOOK_CONFIRMATION", "false").lower() == "true"
+
+# Але стіну проти входу краще залишити як hard-filter
 USE_ORDER_BOOK_WALL_FILTER = os.getenv("USE_ORDER_BOOK_WALL_FILTER", "true").lower() == "true"
 
 
@@ -220,8 +306,15 @@ USE_CVD_CONFIRMATION    = os.getenv("USE_CVD_CONFIRMATION", "false").lower() == 
 # BOS — Break of Structure
 # ═══════════════════════════════════════════════════════════════
 
+# USE_BOS_CONFIRMATION — вмикає BOS в старій range стратегії
+# В generator.py та dual_df.py BOS завжди обов'язковий
 USE_BOS_CONFIRMATION  = os.getenv("USE_BOS_CONFIRMATION", "false").lower() == "true"
 BOS_VOLUME_MULT       = float(os.getenv("BOS_VOLUME_MULT",      1.2))
+
+# ENTRY_SWING_LOOKBACK — structure_lookback для detect_bos в entry.py
+# generator.py бере з SYMBOL_CONFIG["structure_lookback"] (дефолт 5)
+# dual_df.py використовує дефолт з entry.py (5)
+# старий range стратегія бере цю константу
 ENTRY_SWING_LOOKBACK  = int(os.getenv("ENTRY_SWING_LOOKBACK",   3))
 
 
@@ -238,9 +331,17 @@ ENTRY_VOLUME_MIN_RATIO     = float(os.getenv("ENTRY_VOLUME_MIN_RATIO", 0.8))
 # TP / SL
 # ═══════════════════════════════════════════════════════════════
 
+# TP_RANGE_PCT — для signal_engine (mode="range_pct")
+# TP = range_low + range_size × TP_RANGE_PCT (0.70 = 70% рейнджу)
 TP_RANGE_PCT          = float(os.getenv("TP_RANGE_PCT",       0.70))
+
+# SL_ATR_BUFFER — для signal_engine і calculate_levels(mode="range_pct")
+# SL = deviation_extreme ± atr × SL_ATR_BUFFER
 SL_ATR_BUFFER         = float(os.getenv("SL_ATR_BUFFER",      0.3))
-SL_ATR_MULT_RANGE     = SL_ATR_BUFFER
+SL_ATR_MULT_RANGE     = SL_ATR_BUFFER   # аліас для сумісності
+
+# Для dual_df (mode="midpoint") — stop_pad береться з SYMBOL_CONFIG
+# або з дефолту в entry.py (0.12 ATR). Окрема константа тут для ясності:
 SL_ATR_STOP_PAD       = float(os.getenv("SL_ATR_STOP_PAD",    0.12))
 
 # Глобальний мінімальний стоп у % від ціни (fallback, якщо в SYMBOL_CONFIG
@@ -254,12 +355,16 @@ SL_ZONE_BUFFER_PCT    = float(os.getenv("SL_ZONE_BUFFER_PCT",   0.0005))
 # COOLDOWN / LIMITS
 # ═══════════════════════════════════════════════════════════════
 
-MIN_CANDLES_BETWEEN_TRADES = int(os.getenv("MIN_CANDLES_BETWEEN_TRADES", 3))
-MAX_TRADES_PER_HOUR        = int(os.getenv("MAX_TRADES_PER_HOUR",        4))
-MAX_TRADES_PER_DAY         = int(os.getenv("MAX_TRADES_PER_DAY",        12))
-COOLDOWN_AFTER_LOSS_MIN    = int(os.getenv("COOLDOWN_AFTER_LOSS_MIN",   10))
-MAX_CONSECUTIVE_LOSSES     = int(os.getenv("MAX_CONSECUTIVE_LOSSES",     3))
-COOLDOWN_AFTER_SERIES_MIN  = int(os.getenv("COOLDOWN_AFTER_SERIES_MIN", 60))
+# Кулдаун між угодами трактується в live_trade як ХВИЛИНИ. 2 хв — активний
+# скальп, але без подвійних входів на тій самій свічці.
+MIN_CANDLES_BETWEEN_TRADES = int(os.getenv("MIN_CANDLES_BETWEEN_TRADES", 2))
+# Підняті ліміти: мета зараз — розторгувати бота і зібрати статистику.
+# Звужуватимемо назад під час тюнінгу win-rate.
+MAX_TRADES_PER_HOUR        = int(os.getenv("MAX_TRADES_PER_HOUR",        6))
+MAX_TRADES_PER_DAY         = int(os.getenv("MAX_TRADES_PER_DAY",        30))
+COOLDOWN_AFTER_LOSS_MIN    = int(os.getenv("COOLDOWN_AFTER_LOSS_MIN",    8))
+MAX_CONSECUTIVE_LOSSES     = int(os.getenv("MAX_CONSECUTIVE_LOSSES",     4))
+COOLDOWN_AFTER_SERIES_MIN  = int(os.getenv("COOLDOWN_AFTER_SERIES_MIN", 45))
 
 MAX_CONFIRMATION_AGE_MIN   = int(os.getenv("MAX_CONFIRMATION_AGE_MIN",  90))
 MAX_SIGNAL_AGE_MIN         = int(os.getenv("MAX_SIGNAL_AGE_MIN",        60))

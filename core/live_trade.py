@@ -44,9 +44,13 @@ from config.settings import (
     USE_ORDER_BOOK_CONFIRMATION,
     USE_ORDER_BOOK_WALL_FILTER,
     SYMBOL_CONFIG,
+    USE_SWEEP_STRATEGY, USE_MEANREV_STRATEGY, USE_VWAP_STRATEGY,
+    STRATEGY_PRIORITY,
 )
 from indicators.range_detector import detect_active_range, calculate_atr
 from signals.generator import generate_scalp_signal
+from signals.mean_reversion import generate_meanrev_signal
+from signals.vwap_strategy import generate_vwap_signal
 from signals.dual_tf import generate_dual_tf_signal
 from signals.calculator import calculate_position, check_daily_limits
 # DB імпорт — підключимо в наступному кроці
@@ -290,15 +294,15 @@ class LiveTrader:
                 await ws.send(json.dumps({"op": "ping"}))
             except Exception:
                 break  # з'єднання закрите — виходимо
-
+ 
     async def _stream_orderbook(self, symbol: str) -> None:
         ws_symbol = symbol.replace("/", "").replace(":USDT", "")
         url       = "wss://stream.bybit.com/v5/public/linear"
         sub_msg   = json.dumps({"op": "subscribe", "args": [f"orderbook.50.{ws_symbol}"]})
-
+ 
         full_bids: dict = {}
         full_asks: dict = {}
-
+ 
         while self._running:
             try:
                 async with websockets.connect(
@@ -311,15 +315,15 @@ class LiveTrader:
                     await ws.send(sub_msg)
                     full_bids.clear()
                     full_asks.clear()
-
+ 
                     keepalive = asyncio.create_task(
                         self._bybit_keepalive(ws, f"OB {symbol}")
                     )
-
+ 
                     try:
                         first_raw = await asyncio.wait_for(ws.recv(), timeout=10)
                         first     = json.loads(first_raw)
-
+ 
                         if first.get("type") == "snapshot":
                             logger.info(f"✅ OB WebSocket підключено: {symbol}")
                             for b in first.get("data", {}).get("b", []):
@@ -336,24 +340,24 @@ class LiveTrader:
                             logger.debug(f"OB {symbol}: pong")
                         else:
                             logger.warning(f"OB несподіваний перший меседж: {first}")
-
+ 
                         while self._running:
                             try:
                                 raw = await asyncio.wait_for(ws.recv(), timeout=30)
                             except asyncio.TimeoutError:
                                 continue
-
+ 
                             data     = json.loads(raw)
                             msg_type = data.get("type")
                             topic    = data.get("topic", "")
                             ob_data  = data.get("data", {})
-
+ 
                             if data.get("op") == "pong":
                                 continue
-
+ 
                             if not topic.startswith("orderbook"):
                                 continue
-
+ 
                             if msg_type == "snapshot":
                                 full_bids = {b[0]: b[1] for b in ob_data.get("b", [])}
                                 full_asks = {a[0]: a[1] for a in ob_data.get("a", [])}
@@ -368,7 +372,7 @@ class LiveTrader:
                                         full_asks.pop(price, None)
                                     else:
                                         full_asks[price] = qty
-
+ 
                             if full_bids and full_asks:
                                 sorted_bids = sorted(
                                     full_bids.items(), key=lambda x: float(x[0]), reverse=True
@@ -376,7 +380,7 @@ class LiveTrader:
                                 sorted_asks = sorted(
                                     full_asks.items(), key=lambda x: float(x[0])
                                 )[:25]
-
+ 
                                 snapshot = OrderBookSnapshot(
                                     symbol    = symbol,
                                     timestamp = datetime.now(timezone.utc),
@@ -384,18 +388,18 @@ class LiveTrader:
                                     asks      = [[float(p), float(q)] for p, q in sorted_asks],
                                 )
                                 snapshot.analyze()
-
+ 
                                 with self._ob_lock:
                                     self.state.ob_snapshots[symbol] = snapshot
                                     if symbol not in self.state.ob_imbalance_history:
                                         self.state.ob_imbalance_history[symbol] = deque(maxlen=50)
                                     self.state.ob_imbalance_history[symbol].append(snapshot.imbalance)
-
+ 
                                 logger.debug(f"{symbol} OB [{msg_type}]: {snapshot.summary()}")
-
+ 
                     finally:
                         keepalive.cancel()
-
+ 
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -403,13 +407,13 @@ class LiveTrader:
                 full_bids.clear()
                 full_asks.clear()
                 await asyncio.sleep(5)
-
+ 
     async def _stream_candles(self, symbol: str, tf: str) -> None:
         ws_symbol = symbol.replace("/", "").replace(":USDT", "")
         url       = "wss://stream.bybit.com/v5/public/linear"
         sub_msg   = json.dumps({"op": "subscribe", "args": [f"kline.{tf}.{ws_symbol}"]})
         key       = f"{symbol}_{tf}"
-
+ 
         while self._running:
             try:
                 async with websockets.connect(
@@ -420,15 +424,15 @@ class LiveTrader:
                     open_timeout  = 10,
                 ) as ws:
                     await ws.send(sub_msg)
-
+ 
                     keepalive = asyncio.create_task(
                         self._bybit_keepalive(ws, f"Candles {symbol} {tf}")
                     )
-
+ 
                     try:
                         first_raw = await asyncio.wait_for(ws.recv(), timeout=10)
                         first     = json.loads(first_raw)
-
+ 
                         if first.get("op") == "subscribe" and first.get("success"):
                             logger.info(f"✅ Candles WebSocket: {symbol} {tf}")
                         elif first.get("op") == "pong":
@@ -438,18 +442,18 @@ class LiveTrader:
                                 f"✅ Candles WebSocket: {symbol} {tf} "
                                 f"| first={first.get('op') or first.get('type')}"
                             )
-
+ 
                         while self._running:
                             try:
                                 raw = await asyncio.wait_for(ws.recv(), timeout=30)
                             except asyncio.TimeoutError:
                                 continue
-
+ 
                             data = json.loads(raw)
-
+ 
                             if data.get("op") == "pong":
                                 continue
-
+ 
                             if data.get("topic", "").startswith("kline"):
                                 for candle in data.get("data", []):
                                     if candle.get("confirm", False):
@@ -466,16 +470,15 @@ class LiveTrader:
                                             logger.debug(
                                                 f"Нова {symbol} {tf}: close={c[4]:.4f} vol={c[5]:.2f}"
                                             )
-
+ 
                     finally:
                         keepalive.cancel()
-
+ 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.warning(f"Candles WebSocket помилка {symbol} {tf}: {e}")
                 await asyncio.sleep(5)
-
     # ── Торговий цикл ─────────────────────────────────────────
 
     async def _trading_loop(self) -> None:
@@ -562,18 +565,29 @@ class LiveTrader:
 
         self._update_range_cache(symbol, df_1h, df_30m)
 
-        # Режим A
-        signal = generate_scalp_signal(
-            df_1h        = df_1h,
-            df_5m        = df_5m,
-            df_1m        = df_1m,
-            symbol       = symbol,
-            cached_range = self.state.cached_range_1h,
-            mode         = "A",
-        )
+        dfs = {"1h": df_1h, "30m": df_30m, "5m": df_5m, "1m": df_1m}
 
-        # DUAL TF тимчасово вимкнений, поки стратегія переписується.
-        # Увімкнути можна через USE_DUAL_TF_STRATEGY=true в .env
+        # ── Диспетчер стратегій за пріоритетом ──────────────────
+        # Перша стратегія зі STRATEGY_PRIORITY, що дала валідний сигнал —
+        # перемагає. Усі три незалежні: sweep / meanrev / vwap.
+        signal = None
+        for name in STRATEGY_PRIORITY:
+            name = name.strip().lower()
+            if name == "sweep" and USE_SWEEP_STRATEGY:
+                signal = generate_scalp_signal(
+                    df_1h=df_1h, df_5m=df_5m, df_1m=df_1m,
+                    symbol=symbol, cached_range=self.state.cached_range_1h, mode="A",
+                )
+            elif name == "meanrev" and USE_MEANREV_STRATEGY:
+                signal = generate_meanrev_signal(dfs, symbol)
+            elif name == "vwap" and USE_VWAP_STRATEGY:
+                signal = generate_vwap_signal(dfs, symbol)
+            else:
+                continue
+            if signal is not None:
+                break
+
+        # DUAL TF — опційний легасі-фолбек (вимкнений за замовчуванням)
         if signal is None and USE_DUAL_TF_STRATEGY and df_30m is not None:
             signal = generate_dual_tf_signal(
                 df_1h            = df_1h,
@@ -588,7 +602,7 @@ class LiveTrader:
         if signal is None:
             return None
 
-        # ── Order Book confirmation / logging ───────────────
+                # ── Order Book confirmation / logging ───────────────
         #
         # Нова логіка:
         # - OB imbalance НЕ є обов'язковим фільтром за замовчуванням.
@@ -694,6 +708,7 @@ class LiveTrader:
         tp        = Decimal(str(signal["tp"]))
         sl        = Decimal(str(signal["sl"]))
 
+        sig_min_rr = signal.get("min_rr")
         pos = calculate_position(
             symbol      = symbol,
             deposit     = self.state.equity,
@@ -701,6 +716,7 @@ class LiveTrader:
             entry_price = entry,
             stop_loss   = sl,
             take_profit = tp,
+            min_rr      = Decimal(str(sig_min_rr)) if sig_min_rr is not None else None,
         )
 
         if "error" in pos:
@@ -708,7 +724,10 @@ class LiveTrader:
             return
 
         if not pos["rr_ok"]:
-            logger.warning(f"R:R {pos['rr_ratio']} < {MIN_RISK_REWARD} — skip")
+            logger.warning(
+                f"R:R {pos['rr_ratio']} < floor {pos.get('rr_floor', MIN_RISK_REWARD)} "
+                f"[{signal.get('strategy', signal.get('mode', '?'))}] — skip"
+            )
             return
 
         qty  = float(pos["quantity"])
@@ -770,11 +789,13 @@ class LiveTrader:
                 "reward_usdt": float(pos["reward_usdt"]),
                 "ob_imbalance": signal.get("ob_imbalance", 0),
                 "mode":        signal.get("mode", "unknown"),
+                "strategy":    signal.get("strategy", signal.get("mode", "unknown")),
                 "cvd_ok":       signal.get("cvd_ok"),
                 "volume_ok":    signal.get("volume_ok"),
                 "ob_direction": signal.get("ob_direction"),
                 "ob_confirmed": signal.get("ob_confirmed"),
                 "ob_stale":     signal.get("ob_stale", False),
+                # Індикатори для запису в БД
                 "atr":         signal.get("atr"),
                 "raw_rr":      signal.get("raw_rr"),
                 "cvd_signal":  signal.get("cvd_signal"),

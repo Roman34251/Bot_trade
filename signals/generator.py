@@ -406,6 +406,7 @@ def generate_scalp_signal(
 
     symbol_cfg = SYMBOL_CONFIG.get(symbol, {})
 
+    # Налаштування з можливістю перевизначення через config
     range_lookback = int(symbol_cfg.get("range_lookback", 48 if mode.upper() == "A" else 24))
     sweep_buffer_atr = float(symbol_cfg.get("sweep_buffer_atr", 0.15))
     stop_pad_atr = float(symbol_cfg.get("stop_pad_atr", 0.12))
@@ -414,6 +415,13 @@ def generate_scalp_signal(
     structure_lookback = int(symbol_cfg.get("structure_lookback", 5))
     min_rr = float(symbol_cfg.get("min_rr", 1.50))
     cvd_lookback = int(symbol_cfg.get("cvd_lookback", CVD_LOOKBACK))
+
+    # Sweep як setup-state: шукаємо sweep у вікні останніх sweep_window 1m
+    # свічок (а не лише на 3), вхід — за reclaim + min_confirmations
+    # підтверджень. Раніше потрібен був збіг sweep+BOS+order-flow на ОДНІЙ
+    # свічці → майже ніколи → 0 угод.
+    sweep_window = int(symbol_cfg.get("sweep_window", 12))
+    min_confirmations = int(symbol_cfg.get("min_confirmations", 1))
 
     # Range-параметри — раніше не передавались у _detect_active_range,
     # тому хардкод-дефолти (1.5 / 8.0 / 2.5) ігнорували SYMBOL_CONFIG.
@@ -454,12 +462,14 @@ def generate_scalp_signal(
     range_low = float(range_data["low"])
     range_mid = float(range_data["mid"])
 
-    # ── 3) Sweep ────────────────────────────────────────────
+    # ── 3) Sweep (у вікні sweep_window, reclaim на останній свічці) ──
     long_sweep, long_extreme = _detect_sweep(
-        trigger_df, "long", range_low, range_high, atr, sweep_buffer_atr, lookback_bars=3
+        trigger_df, "long", range_low, range_high, atr, sweep_buffer_atr,
+        lookback_bars=sweep_window,
     )
     short_sweep, short_extreme = _detect_sweep(
-        trigger_df, "short", range_low, range_high, atr, sweep_buffer_atr, lookback_bars=3
+        trigger_df, "short", range_low, range_high, atr, sweep_buffer_atr,
+        lookback_bars=sweep_window,
     )
 
     if long_sweep and short_sweep:
@@ -478,31 +488,43 @@ def generate_scalp_signal(
         f"extreme={sweep_extreme:.2f} range_low={range_low:.2f} range_high={range_high:.2f}"
     )
 
-    # ── 4) BOS / MSS ────────────────────────────────────────
-    if not _detect_bos(trigger_df, direction, structure_lookback=structure_lookback):
-        logger.debug(f"{symbol}: BOS/MSS not confirmed")
-        return None
-
-    # ── 5) Order Flow Delta — ОСНОВНИЙ фільтр ───────────────
+    # ── 4) Підтвердження входу (SCORED, не жорсткий ланцюг) ──
+    # Раніше BOS і order-flow були окремими hard-фільтрами, і обидва мали
+    # спрацювати на тій самій останній свічці → майже ніколи. Тепер це
+    # незалежні "голоси": достатньо min_confirmations з них.
     order_flow_lookback = int(symbol_cfg.get("order_flow_lookback", 3))
-    use_order_flow_filter = bool(symbol_cfg.get("use_order_flow_filter", True))
+    use_order_flow_filter = bool(symbol_cfg.get("use_order_flow_filter", False))
 
     of = order_flow_delta(trigger_df, lookback=order_flow_lookback)
 
-    if use_order_flow_filter:
-        if direction == "long" and not of["is_bullish"]:
-            logger.debug(
-                f"{symbol}: Order Flow не підтримує LONG "
-                f"(delta={of['delta']:.2f})"
-            )
-            return None
+    bos_ok = _detect_bos(trigger_df, direction, structure_lookback=structure_lookback)
+    of_ok = of["is_bullish"] if direction == "long" else of["is_bearish"]
 
-        if direction == "short" and not of["is_bearish"]:
-            logger.debug(
-                f"{symbol}: Order Flow не підтримує SHORT "
-                f"(delta={of['delta']:.2f})"
-            )
-            return None
+    last_c = trigger_df.iloc[-1]
+    if direction == "long":
+        momentum_ok = float(last_c["close"]) > float(last_c["open"])
+    else:
+        momentum_ok = float(last_c["close"]) < float(last_c["open"])
+
+    confirmations = []
+    if bos_ok:
+        confirmations.append("BOS")
+    if of_ok:
+        confirmations.append("OF")
+    if momentum_ok:
+        confirmations.append("MOM")
+
+    # Якщо order-flow явно вмикають як обов'язковий — лишаємо hard-filter
+    if use_order_flow_filter and not of_ok:
+        logger.debug(f"{symbol}: Order Flow hard-filter не підтримує {direction.upper()}")
+        return None
+
+    if len(confirmations) < min_confirmations:
+        logger.debug(
+            f"{symbol}: замало підтверджень {confirmations} "
+            f"({len(confirmations)}/{min_confirmations}) — skip"
+        )
+        return None
 
     # ── 6) CVD / Volume — тільки лог, не hard-filter ─────────
     use_cvd_filter = bool(symbol_cfg.get("use_cvd_filter", False))
@@ -565,9 +587,9 @@ def generate_scalp_signal(
     sl = float(levels["sl"])
 
     logger.info(
-        f"🎯 SIGNAL {direction.upper()} {symbol} | "
+        f"🎯 SWEEP {direction.upper()} {symbol} | "
         f"entry={entry:.2f} TP={tp:.2f} SL={sl:.2f} "
-        f"RR={raw_rr:.2f} | "
+        f"RR={raw_rr:.2f} | confirms={confirmations} | "
         f"OF_delta={of['delta']:.0f} | "
         f"CVD={cvd_sig} ok={cvd_ok} | "
         f"VOL_ok={volume_ok} | mode={mode}"
@@ -581,6 +603,9 @@ def generate_scalp_signal(
         "sl": sl,
         "atr": atr,
         "raw_rr": raw_rr,
+        "min_rr": min_rr,
+        "strategy": "sweep",
+        "confirmations": confirmations,
         "of_delta": of["delta"],
         "cvd_signal": cvd_sig,
         "sweep_extreme": sweep_extreme,
