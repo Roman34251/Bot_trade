@@ -41,7 +41,7 @@ SYMBOL_CONFIG = {
         # (calculator.calculate_position) окремо рахує NET RR після комісій
         # і порівнює з MIN_RISK_REWARD. На BTC round-trip комісія+сліпедж
         # ~0.17% notional, тож gross мусить мати запас (див. розрахунок нижче).
-        "min_rr":             2.5,
+        "min_rr":             2.0,
 
         # Мінімальна дистанція SL у % від ціни. Захищає від двох речей одразу:
         #   1) комісія (0.17%) з'їдає угоду з надто тісним стопом
@@ -95,7 +95,8 @@ SYMBOL_CONFIG = {
             "require_rsi":    True,    # BB-торкання має підтверджуватись RSI
             "tp_target":      "mid",   # ціль = середня смуга BB (= середнє)
             "sl_atr_buffer":  0.5,     # SL за смугою + 0.5·ATR
-            "min_width_pct":  0.30,    # ігнорувати надто вузький канал (TP < комісій)
+            "min_width_pct":  0.18,    # знижено з 0.30: на вихідних low-vol стискав канал
+                                       #   <0.30% і РІЗАВ УСІ сигнали (причина 0 угод за вихідні)
             "use_adx_filter": False,   # поки вимкнено → більше угод; вмикати при тюнінгу
             "adx_max":        35,      # якщо use_adx_filter: пропускати при ADX>35 (тренд)
             "min_sl_pct":     0.0018,  # ВЛАСНИЙ мін. SL (захист маржі), НЕ глобальний 0.5%
@@ -115,16 +116,49 @@ SYMBOL_CONFIG = {
             "enabled":        True,
             "tf":             "5m",
             "window":         96,      # ковзний VWAP ≈ 8h на 5m (стабільніше за сесійний)
-            "k_band":         2.0,     # вхід коли ціна за межами VWAP±2σ
+            "k_band":         1.8,     # вхід коли ціна за межами VWAP±1.8σ (знижено для угод)
             "require_rsi":    False,   # VWAP-девіації достатньо; RSI лише як бонус
             "rsi_period":     14,
             "rsi_oversold":   42,      # дуже м'яко (майже не блокує)
             "rsi_overbought": 58,
             "sl_k":           3.5,     # SL на рівні VWAP±3.5σ (за межею входу)
             "tp_target":      "vwap",  # ціль = сам VWAP
-            "min_dev_pct":    0.20,    # мін. девіація від VWAP (інакше TP < комісій)
+            "min_dev_pct":    0.12,    # мін. девіація від VWAP (знижено: у будні vol вище)
             "min_sl_pct":     0.002,   # власний мін. SL (захист маржі)
             "min_rr":         0.6,     # VWAP-девіація дає кращий RR за BB; поріг вищий
+        },
+
+        # ════════════════════════════════════════════════════════
+        # СТРАТЕГІЯ D — TREND-FOLLOWING (EMA-stack pullback)
+        # Найнадійніша проста трендова стратегія (за дослідженням).
+        # Торгує ЛИШЕ за трендом 1h, вхід на відкаті до EMA20..EMA50 на 5m.
+        # ВАЖЛИВО: BTC зараз у сильному НИЗХІДНОМУ тренді → ця стратегія
+        # шортить ралі = найякісніше джерело угод саме зараз.
+        # ════════════════════════════════════════════════════════
+        "trend": {
+            "enabled":        True,
+            "trend_tf":       "1h",    # ТФ тренду ("що")
+            "entry_tf":       "5m",    # ТФ входу ("коли")
+            "ema_fast":       20,
+            "ema_mid":        50,
+            "ema_slow":       200,
+            "use_ema200_filter": True, # вимагати price/EMA50 по той бік EMA200
+            "ema_slope_lookback": 5,   # EMA50 має рости/падати за 5 барів
+            "adx_period":     14,
+            "adx_min":        18,      # <18 = боковик, не торгуємо (м'якше за 20 → більше угод)
+            "atr_period":     14,
+            "pullback_lookback": 6,    # у скількох останніх 5m барах шукати торкання EMA20
+            "max_pullback_below_ema_atr": 0.5,  # відкид, якщо структуру зламано
+            "max_extension_atr": 1.2,  # не входити, якщо ціна задерта від EMA20
+            "swing_lookback": 10,      # свінг для структурного SL
+            "sl_buffer_atr":  0.3,     # SL трохи за свінгом/EMA50
+            "tp_r":           2.2,     # TP = 2.2R (gross; після комісій net ≈1.5)
+            "use_rsi_confirm": False,  # поки вимкнено → більше угод
+            "rsi_period":     14,
+            "min_sl_pct":     0.0018,  # захист маржі
+            # min_rr = NET-поріг. 2.2R gross дає ≈1.5 net (комісія 0.17% з'їдає
+            # частину). 1.4 net із трендовим фільтром (win 45-55%) = сильний +EV.
+            "min_rr":         1.4,
         },
     }
 
@@ -139,12 +173,14 @@ SYMBOL_CONFIG = {
 USE_SWEEP_STRATEGY   = os.getenv("USE_SWEEP_STRATEGY",   "true").lower() == "true"
 USE_MEANREV_STRATEGY = os.getenv("USE_MEANREV_STRATEGY", "true").lower() == "true"
 USE_VWAP_STRATEGY    = os.getenv("USE_VWAP_STRATEGY",    "true").lower() == "true"
+USE_TREND_STRATEGY   = os.getenv("USE_TREND_STRATEGY",   "true").lower() == "true"
 
 # Порядок перевірки в live_trade._check_signal. Перша стратегія, що дала
-# валідний сигнал — виконується. Mean-reversion першою, бо дає найбільше
-# угод (мета зараз — РОЗТОРГУВАТИ бота і зібрати статистику).
+# валідний сигнал — виконується. TREND першим: він торгує ЗА трендом (зараз
+# BTC падає → шорти з трендом = найякісніші угоди). Далі mean-reversion/vwap
+# для частоти, sweep останнім.
 STRATEGY_PRIORITY = os.getenv(
-    "STRATEGY_PRIORITY", "meanrev,vwap,sweep"
+    "STRATEGY_PRIORITY", "trend,vwap,meanrev,sweep"
 ).split(",")
 
 

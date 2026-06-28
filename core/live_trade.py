@@ -45,13 +45,14 @@ from config.settings import (
     USE_ORDER_BOOK_WALL_FILTER,
     SYMBOL_CONFIG,
     USE_SWEEP_STRATEGY, USE_MEANREV_STRATEGY, USE_VWAP_STRATEGY,
+    USE_TREND_STRATEGY,
     STRATEGY_PRIORITY,
 )
 from indicators.range_detector import detect_active_range, calculate_atr
 from signals.generator import generate_scalp_signal
 from signals.mean_reversion import generate_meanrev_signal
 from signals.vwap_strategy import generate_vwap_signal
-from signals.dual_tf import generate_dual_tf_signal
+from signals.dual_tf import generate_trend_signal, generate_dual_tf_signal
 from signals.calculator import calculate_position, check_daily_limits
 # DB імпорт — підключимо в наступному кроці
 # from db.trade_logger import log_trade_open, log_trade_close
@@ -152,7 +153,7 @@ class LiveState:
 
 class LiveTrader:
 
-    CANDLE_BUFFER    = 200
+    CANDLE_BUFFER    = 250   # ≥210 щоб EMA200 на 1h встигла "прогрітись" (трендова стратегія)
     RANGE_UPDATE_MIN = 60
 
     def __init__(self):
@@ -578,7 +579,9 @@ class LiveTrader:
         signal = None
         for name in STRATEGY_PRIORITY:
             name = name.strip().lower()
-            if name == "sweep" and USE_SWEEP_STRATEGY:
+            if name == "trend" and USE_TREND_STRATEGY:
+                signal = generate_trend_signal(dfs, symbol)
+            elif name == "sweep" and USE_SWEEP_STRATEGY:
                 signal = generate_scalp_signal(
                     df_1h=df_1h, df_5m=df_5m, df_1m=df_1m,
                     symbol=symbol, cached_range=self.state.cached_range_1h, mode="A",
