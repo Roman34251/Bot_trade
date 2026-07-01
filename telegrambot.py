@@ -37,6 +37,29 @@ from config.settings import BYBIT_DEMO
 from core.live_trade import LiveTrader
 from config.settings import LOG_LEVEL, LOG_ROTATION, LOG_RETENTION
 
+# ── для /diag (діагностика в Telegram) ────────────────────
+from decimal import Decimal
+from config.settings import (
+    SYMBOL_CONFIG, STRATEGY_PRIORITY, DEPOSIT_USDT, RISK_PER_TRADE_PCT,
+)
+from signals.generator import generate_scalp_signal
+from signals.calculator import calculate_position
+from indicators.oscillators import bollinger_bands, rsi, vwap_bands, ema, adx
+try:
+    from signals.mean_reversion import generate_meanrev_signal
+except Exception:
+    generate_meanrev_signal = None
+try:
+    from signals.vwap_strategy import generate_vwap_signal
+except Exception:
+    generate_vwap_signal = None
+try:
+    from signals.dual_tf import generate_trend_signal
+except Exception:
+    generate_trend_signal = None
+
+_DIAG_SYMBOL = "BTC/USDT:USDT"
+
 # ── Конфіг ────────────────────────────────────────────────
 
 def _load_tg_config() -> tuple[str, int]:
@@ -105,6 +128,9 @@ def kb_main() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="📈 Позиція", callback_data="position"),
             InlineKeyboardButton(text="📡 Order Book", callback_data="orderbook"),
+        ],
+        [
+            InlineKeyboardButton(text="🔬 Діагностика", callback_data="diag"),
         ],
         [
             InlineKeyboardButton(text="⏸ Пауза", callback_data="pause"),
@@ -378,6 +404,115 @@ def fmt_orderbook(trader: LiveTrader) -> str:
     return "\n".join(lines)
 
 
+# ── Діагностика (та сама логіка, що diagnose.py, але на ЖИВИХ ─────
+#    свічках бота — показує рівно те, що «бачить» трейдер) ──────────
+
+def _diag_calc(sig):
+    return calculate_position(
+        symbol=_DIAG_SYMBOL, deposit=Decimal(str(DEPOSIT_USDT)),
+        risk_pct=Decimal(str(RISK_PER_TRADE_PCT)),
+        entry_price=Decimal(str(sig["entry"])),
+        stop_loss=Decimal(str(sig["sl"])),
+        take_profit=Decimal(str(sig["tp"])),
+        min_rr=Decimal(str(sig["min_rr"])) if sig.get("min_rr") is not None else None,
+    )
+
+
+def _diag_run_all(dfs):
+    res = {}
+    if generate_trend_signal:
+        try: res["trend"] = generate_trend_signal(dfs, _DIAG_SYMBOL)
+        except Exception: res["trend"] = None
+    if generate_vwap_signal:
+        try: res["vwap"] = generate_vwap_signal(dfs, _DIAG_SYMBOL)
+        except Exception: res["vwap"] = None
+    if generate_meanrev_signal:
+        try: res["meanrev"] = generate_meanrev_signal(dfs, _DIAG_SYMBOL)
+        except Exception: res["meanrev"] = None
+    try:
+        res["sweep"] = generate_scalp_signal(df_1h=dfs.get("1h"), df_5m=dfs.get("5m"),
+                                              df_1m=dfs.get("1m"), symbol=_DIAG_SYMBOL,
+                                              cached_range=None, mode="A")
+    except Exception:
+        res["sweep"] = None
+    return res
+
+
+def fmt_diagnostic(trader: LiveTrader, scan_bars: int = 120) -> str:
+    """
+    Знімок індикаторів проти порогів + короткий реплей історії на ЖИВИХ
+    свічках бота. Викликається з Telegram (/diag або кнопка).
+    ВАЖЛИВО: синхронна і трохи важка (реплей) — виклик робимо в executor,
+    щоб не блокувати торговий цикл.
+    """
+    get = trader._get_df
+    dfs = {tf: get(_DIAG_SYMBOL, tf) for tf in ["1h", "30m", "5m", "1m"]}
+    df5 = dfs.get("5m")
+    if df5 is None or len(df5) < 30:
+        return "*🔬 ДІАГНОСТИКА*\n\n_Дані ще вантажаться (5m свічок мало). Зачекай кілька хв._"
+
+    cfg = SYMBOL_CONFIG.get(_DIAG_SYMBOL, {})
+    price = float(df5["close"].iloc[-1])
+    L = ["*🔬 ДІАГНОСТИКА*", f"BTC = `{price:.1f}`  |  пріоритет `{','.join(STRATEGY_PRIORITY)}`", ""]
+
+    mr = cfg.get("meanrev", {})
+    if mr.get("enabled"):
+        bb = bollinger_bands(df5["close"], int(mr.get("bb_period", 20)), float(mr.get("bb_std", 2.0)))
+        rv = float(rsi(df5["close"], int(mr.get("rsi_period", 14))).iloc[-1])
+        ok = "✅" if bb["width_pct"] >= float(mr.get("min_width_pct", 0)) else "❌"
+        L.append(f"*MEANREV* {ok}  BB `{bb['width_pct']:.2f}%`≥{mr.get('min_width_pct')} "
+                 f"%b `{bb['percent_b']:.2f}` RSI `{rv:.0f}`")
+
+    vw = cfg.get("vwap", {})
+    if vw.get("enabled"):
+        win = vw.get("window", 96); win = int(win) if win else None
+        vb = vwap_bands(df5, window=win, k=float(vw.get("k_band", 2.0)))
+        ok = "✅" if abs(vb["dev_pct"]) >= float(vw.get("min_dev_pct", 0)) else "❌"
+        L.append(f"*VWAP* {ok}  дев `{vb['dev_pct']:+.2f}%`≥{vw.get('min_dev_pct')} "
+                 f"смуги `{vb['lower']:.0f}..{vb['upper']:.0f}`")
+
+    tc = cfg.get("trend", {})
+    d1 = dfs.get("1h")
+    if tc.get("enabled") and d1 is not None and len(d1) > 210:
+        c = d1["close"]
+        ef, em, es = ema(c, 20).iloc[-1], ema(c, 50).iloc[-1], ema(c, 200).iloc[-1]
+        av = float(adx(d1, 14).iloc[-1])
+        gate = ("LONG" if (ef > em > es and c.iloc[-1] > em)
+                else "SHORT" if (ef < em < es and c.iloc[-1] < em) else "боковик")
+        ok = "✅" if av >= float(tc.get("adx_min", 20)) else "❌"
+        L.append(f"*TREND* ADX `{av:.0f}`≥{tc.get('adx_min')} {ok}  gate `{gate}`")
+
+    # спрацьовує зараз?
+    now = _diag_run_all(dfs)
+    fired_now = [n for n, s in now.items() if s is not None]
+    L += ["", f"*зараз дають сигнал:* {', '.join(fired_now) if fired_now else '— нема'}"]
+
+    # короткий реплей історії
+    n = min(scan_bars, len(df5) - 10)
+    fired, execd = {}, {}
+    if n > 20:
+        for cutoff in df5.index[-n:]:
+            sub = {tf: (None if d is None else d.loc[d.index <= cutoff]) for tf, d in dfs.items()}
+            for name, sig in _diag_run_all(sub).items():
+                if sig is None:
+                    continue
+                fired[name] = fired.get(name, 0) + 1
+                pos = _diag_calc(sig)
+                if "error" not in pos and pos.get("rr_ok"):
+                    execd[name] = execd.get(name, 0) + 1
+        L += ["", f"*реплей ~{n*5/60:.0f} год (сигнали / відкрились би):*"]
+        for name in ["trend", "vwap", "meanrev", "sweep"]:
+            L.append(f"  `{name:<8}` {fired.get(name,0):>3} / {execd.get(name,0):>3}")
+        total = sum(execd.values())
+        if total > 0:
+            L += ["", f"_Ринок дав ~{total} сетапів. Якщо угод нема → виконання_",
+                  "_(фільтр стіни / помилка ордера / бот не перезапущено)._"]
+        else:
+            L += ["", "_Сетапів мало — тихий ринок або жорсткі пороги._"]
+
+    return "\n".join(L)
+
+
 # ── Telegram Bot ──────────────────────────────────────────
 
 class TradingBot:
@@ -402,6 +537,7 @@ class TradingBot:
         dp.message.register(self.cmd_start, Command("start"))
         dp.message.register(self.cmd_menu, Command("menu"))
         dp.message.register(self.cmd_status, Command("status"))
+        dp.message.register(self.cmd_diag, Command("diag"))
         dp.message.register(self.cmd_stop, Command("stop"))
 
         # ── Inline кнопки ─────────────────────────────────
@@ -409,6 +545,7 @@ class TradingBot:
         dp.callback_query.register(self.cb_pnl, F.data == "pnl")
         dp.callback_query.register(self.cb_position, F.data == "position")
         dp.callback_query.register(self.cb_orderbook, F.data == "orderbook")
+        dp.callback_query.register(self.cb_diag, F.data == "diag")
         dp.callback_query.register(self.cb_pause, F.data == "pause")
         dp.callback_query.register(self.cb_resume, F.data == "resume")
         dp.callback_query.register(self.cb_emg_stop, F.data == "emergency_stop")
@@ -441,6 +578,13 @@ class TradingBot:
             return
         await msg.answer(fmt_status(self.trader), reply_markup=kb_back())
 
+    async def cmd_diag(self, msg: Message) -> None:
+        if not self._is_admin(msg.from_user.id):
+            return
+        await msg.answer("🔬 Рахую діагностику (реплей історії)...")
+        text = await self._diagnostic_text()
+        await msg.answer(text, reply_markup=kb_back())
+
     async def cmd_stop(self, msg: Message) -> None:
         if not self._is_admin(msg.from_user.id):
             return
@@ -471,6 +615,14 @@ class TradingBot:
             return
         await self._edit(cb, fmt_position(self.trader), kb_back())
         await cb.answer()
+
+    async def cb_diag(self, cb: CallbackQuery) -> None:
+        if not self._is_admin(cb.from_user.id):
+            await cb.answer("⛔", show_alert=True)
+            return
+        await cb.answer("🔬 Рахую... (кілька сек)")
+        text = await self._diagnostic_text()
+        await self._edit(cb, text, kb_back())
 
     async def cb_orderbook(self, cb: CallbackQuery) -> None:
         if not self._is_admin(cb.from_user.id):
@@ -637,6 +789,17 @@ class TradingBot:
                 await cb.message.answer(text, reply_markup=markup, parse_mode=None)
         except Exception:
             await cb.message.answer(text, reply_markup=markup, parse_mode=None)
+
+    async def _diagnostic_text(self) -> str:
+        """
+        Рахує fmt_diagnostic у thread-executor, щоб важкий реплей не блокував
+        asyncio-цикл (а отже і торгівлю).
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, fmt_diagnostic, self.trader)
+        except Exception as e:
+            return f"🔬 Діагностика впала: `{e}`"
 
     async def run(self) -> None:
         """Запускає polling."""
