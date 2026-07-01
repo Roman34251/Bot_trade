@@ -1,0 +1,296 @@
+"""
+ДІАГНОСТИКА «ЧОМУ НЕМАЄ УГОД»
+==============================
+Запуск на твоєму ПК (де є ccxt і доступ до Bybit):
+
+    python diagnose.py
+
+Скрипт:
+  1) тягне ЖИВІ свічки BTC з Bybit (public REST, без ключів);
+  2) друкує поточні значення індикаторів ПРОТИ порогів кожної стратегії;
+  3) запускає всі стратегії один раз і показує спрацювала / ні + причину
+     (вмикає DEBUG-логи — там кожна стратегія пише, чому пропускає сигнал);
+  4) для сигналів, що спрацювали, рахує позицію з комісіями і показує net RR
+     та чи проходить rr_ok (тобто чи реально відкрилася б угода).
+
+Так ти за 10 секунд побачиш, де саме «затик»:
+  - якщо стратегії НЕ дають сигналів → ринок не дає сетапів АБО пороги жорсткі;
+  - якщо сигнали Є, а угод у боті немає → проблема у виконанні ордера
+    (OB-фільтр стіни / create_order / маржа) → шукай у логах бота помилки.
+"""
+
+import sys
+from decimal import Decimal
+
+import pandas as pd
+from loguru import logger
+
+# показуємо DEBUG — саме там стратегії друкують причину пропуску
+logger.remove()
+logger.add(sys.stdout, level="DEBUG",
+           format="<level>{level: <7}</level> | {message}")
+
+try:
+    import ccxt
+except ImportError:
+    print("❌ ccxt не встановлено. pip install ccxt")
+    sys.exit(1)
+
+from config.settings import (
+    SYMBOL_CONFIG, DEPOSIT_USDT, RISK_PER_TRADE_PCT,
+)
+try:
+    from config.settings import STRATEGY_PRIORITY
+except Exception:
+    STRATEGY_PRIORITY = ["meanrev", "vwap", "sweep"]
+
+from signals.generator import generate_scalp_signal
+from signals.calculator import calculate_position
+from indicators.range_detector import calculate_atr
+from indicators.oscillators import bollinger_bands, rsi, vwap_bands, ema, adx
+
+# нові стратегії можуть бути ще не задеплоєні — імпортуємо безпечно
+try:
+    from signals.mean_reversion import generate_meanrev_signal
+except Exception:
+    generate_meanrev_signal = None
+try:
+    from signals.vwap_strategy import generate_vwap_signal
+except Exception:
+    generate_vwap_signal = None
+try:
+    from signals.dual_tf import generate_trend_signal
+except Exception:
+    generate_trend_signal = None
+
+SYMBOL = "BTC/USDT:USDT"
+
+
+def fetch(ex, tf, limit=250):
+    raw = ex.fetch_ohlcv(SYMBOL, tf, limit=limit)
+    df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    df.set_index("ts", inplace=True)
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = df[c].astype(float)
+    return df
+
+
+def line(txt=""):
+    print(txt)
+
+
+def run_calc(sig):
+    pos = calculate_position(
+        symbol=SYMBOL, deposit=Decimal(str(DEPOSIT_USDT)),
+        risk_pct=Decimal(str(RISK_PER_TRADE_PCT)),
+        entry_price=Decimal(str(sig["entry"])),
+        stop_loss=Decimal(str(sig["sl"])),
+        take_profit=Decimal(str(sig["tp"])),
+        min_rr=Decimal(str(sig["min_rr"])) if sig.get("min_rr") is not None else None,
+    )
+    return pos
+
+
+def _truncate(dfs, cutoff):
+    """Обрізає всі df до свічок з timestamp <= cutoff (для реплею історії)."""
+    out = {}
+    for tf, df in dfs.items():
+        out[tf] = None if df is None else df.loc[df.index <= cutoff]
+    return out
+
+
+def _run_all(dfs, symbol):
+    """Повертає dict strat->signal (None якщо не спрацювала)."""
+    res = {}
+    if generate_trend_signal:
+        try: res["trend"] = generate_trend_signal(dfs, symbol)
+        except Exception: res["trend"] = None
+    if generate_vwap_signal:
+        try: res["vwap"] = generate_vwap_signal(dfs, symbol)
+        except Exception: res["vwap"] = None
+    if generate_meanrev_signal:
+        try: res["meanrev"] = generate_meanrev_signal(dfs, symbol)
+        except Exception: res["meanrev"] = None
+    try:
+        res["sweep"] = generate_scalp_signal(df_1h=dfs.get("1h"), df_5m=dfs.get("5m"),
+                                              df_1m=dfs.get("1m"), symbol=symbol,
+                                              cached_range=None, mode="A")
+    except Exception:
+        res["sweep"] = None
+    return res
+
+
+def scan_history(dfs, symbol, scan_bars=180):
+    """
+    Реплей останніх scan_bars 5m-свічок: скільки разів КОЖНА стратегія дала б
+    сигнал і скільки з них реально відкрились би (net RR ok). Це прямо
+    відповідає на питання «чи давав ринок сетапи цього тижня».
+    """
+    df5 = dfs.get("5m")
+    if df5 is None or len(df5) < scan_bars + 10:
+        line("   (замало 5m історії для реплею)")
+        return
+    fired = {}
+    execd = {}
+    idxs = df5.index[-scan_bars:]
+    logger.remove()
+    logger.add(sys.stdout, level="WARNING")   # тиша під час реплею
+    for cutoff in idxs:
+        sub = _truncate(dfs, cutoff)
+        for name, sig in _run_all(sub, symbol).items():
+            if sig is None:
+                continue
+            fired[name] = fired.get(name, 0) + 1
+            pos = run_calc(sig)
+            if "error" not in pos and pos.get("rr_ok"):
+                execd[name] = execd.get(name, 0) + 1
+    logger.remove()
+    logger.add(sys.stdout, level="DEBUG", format="<level>{level: <7}</level> | {message}")
+
+    line(f"\n   За останні {scan_bars} 5m-свічок (~{scan_bars*5/60:.0f} год):")
+    names = sorted(set(list(fired) + ["trend", "vwap", "meanrev", "sweep"]))
+    for n in names:
+        line(f"     {n:<8}: сигналів {fired.get(n,0):>3}  |  відкрились би {execd.get(n,0):>3}")
+    total_exec = sum(execd.values())
+    return total_exec
+
+
+def main():
+    scan_bars = 180
+    if len(sys.argv) > 1:
+        try: scan_bars = int(sys.argv[1])
+        except ValueError: pass
+
+    ex = ccxt.bybit({"enableRateLimit": True,
+                     "options": {"defaultType": "linear", "defaultSubType": "linear"}})
+    line("📡 Тягну живі свічки BTC з Bybit...")
+    limits = {"1h": 300, "30m": 400, "5m": 600, "1m": 1000}
+    dfs = {}
+    for tf in ["1h", "30m", "5m", "1m"]:
+        try:
+            dfs[tf] = fetch(ex, tf, limit=limits[tf])
+            line(f"   {tf}: {len(dfs[tf])} свічок, остання ціна {dfs[tf]['close'].iloc[-1]:.1f}")
+        except Exception as e:
+            line(f"   ❌ {tf}: {e}")
+            dfs[tf] = None
+
+    cfg = SYMBOL_CONFIG.get(SYMBOL, {})
+    price = dfs["5m"]["close"].iloc[-1]
+
+    line("\n" + "=" * 64)
+    line(f"РИНОК ЗАРАЗ: BTC = {price:.1f}")
+    line(f"STRATEGY_PRIORITY = {STRATEGY_PRIORITY}")
+    line("=" * 64)
+
+    # ── MEAN-REVERSION діагностика ──────────────────────────
+    mr = cfg.get("meanrev", {})
+    if mr.get("enabled"):
+        df = dfs.get(mr.get("tf", "5m"))
+        bb = bollinger_bands(df["close"], int(mr.get("bb_period", 20)), float(mr.get("bb_std", 2.0)))
+        rv = float(rsi(df["close"], int(mr.get("rsi_period", 14))).iloc[-1])
+        line("\n── MEANREV (BB+RSI) ──")
+        line(f"   BB width = {bb['width_pct']:.3f}%  (потрібно ≥ {mr.get('min_width_pct')})  "
+             f"{'✅' if bb['width_pct'] >= float(mr.get('min_width_pct', 0)) else '❌ канал вузький'}")
+        line(f"   %b = {bb['percent_b']:.2f}  (≤0 = торкнув низ / ≥1 = торкнув верх)")
+        line(f"   RSI = {rv:.1f}  (OS {mr.get('rsi_oversold')} / OB {mr.get('rsi_overbought')})")
+
+    # ── VWAP діагностика ────────────────────────────────────
+    vw = cfg.get("vwap", {})
+    if vw.get("enabled"):
+        df = dfs.get(vw.get("tf", "5m"))
+        win = vw.get("window", 96)
+        win = int(win) if win else None
+        vb = vwap_bands(df, window=win, k=float(vw.get("k_band", 2.0)))
+        line("\n── VWAP (σ-bands) ──")
+        need = len(df) if df is not None else 0
+        line(f"   свічок {need} (потрібно ≥ {(win or 30)+5})")
+        line(f"   VWAP = {vb['vwap']:.1f}  дев = {vb['dev_pct']:+.3f}%  "
+             f"(потрібно |дев| ≥ {vw.get('min_dev_pct')})  "
+             f"{'✅' if abs(vb['dev_pct']) >= float(vw.get('min_dev_pct', 0)) else '❌ замала девіація'}")
+        line(f"   смуги: [{vb['lower']:.0f} .. {vb['upper']:.0f}]  ціна {price:.0f}")
+
+    # ── TREND діагностика ───────────────────────────────────
+    tc = cfg.get("trend", {})
+    if tc.get("enabled") and dfs.get("1h") is not None:
+        d1 = dfs["1h"]
+        c = d1["close"]
+        ef, em, es = ema(c, 20).iloc[-1], ema(c, 50).iloc[-1], ema(c, 200).iloc[-1]
+        adx_v = float(adx(d1, 14).iloc[-1])
+        line("\n── TREND (EMA-stack 1h) ──")
+        line(f"   свічок 1h = {len(d1)} (потрібно ≥ ~210 для EMA200)")
+        line(f"   EMA20={ef:.0f}  EMA50={em:.0f}  EMA200={es:.0f}  ціна={c.iloc[-1]:.0f}")
+        line(f"   ADX = {adx_v:.1f}  (потрібно ≥ {tc.get('adx_min')})  "
+             f"{'✅ тренд' if adx_v >= float(tc.get('adx_min', 20)) else '❌ боковик'}")
+        updn = "LONG-gate" if (ef > em > es and c.iloc[-1] > em) else (
+               "SHORT-gate" if (ef < em < es and c.iloc[-1] < em) else "немає gate (боковик)")
+        line(f"   напрямок тренду: {updn}")
+
+    # ── ЗАПУСК СТРАТЕГІЙ (як у боті) ────────────────────────
+    line("\n" + "=" * 64)
+    line("ЗАПУСК СТРАТЕГІЙ (DEBUG-причини нижче кожної):")
+    line("=" * 64)
+
+    runners = {
+        "trend":   (lambda: generate_trend_signal(dfs, SYMBOL)) if generate_trend_signal else None,
+        "vwap":    (lambda: generate_vwap_signal(dfs, SYMBOL)) if generate_vwap_signal else None,
+        "meanrev": (lambda: generate_meanrev_signal(dfs, SYMBOL)) if generate_meanrev_signal else None,
+        "sweep":   (lambda: generate_scalp_signal(df_1h=dfs["1h"], df_5m=dfs["5m"],
+                                                   df_1m=dfs["1m"], symbol=SYMBOL,
+                                                   cached_range=None, mode="A")),
+    }
+
+    any_signal = False
+    for name in STRATEGY_PRIORITY:
+        name = name.strip().lower()
+        fn = runners.get(name)
+        line(f"\n▶ {name.upper()}")
+        if fn is None:
+            line("   (стратегія недоступна в цій версії коду)")
+            continue
+        try:
+            sig = fn()
+        except Exception as e:
+            line(f"   ❌ виняток: {e}")
+            continue
+        if sig is None:
+            line("   → сигналу немає (причина в DEBUG-рядку вище)")
+            continue
+        any_signal = True
+        pos = run_calc(sig)
+        if "error" in pos:
+            line(f"   ⚠️ сигнал Є, але позиція неможлива: {pos['error']}")
+        else:
+            ok = pos["rr_ok"]
+            line(f"   {'✅ УГОДА ВІДКРИЛАСЬ БИ' if ok else '❌ відсічено net RR'}: "
+                 f"{sig['direction'].upper()} entry={sig['entry']:.1f} "
+                 f"TP={sig['tp']:.1f} SL={sig['sl']:.1f} | net RR={pos['rr_ratio']} "
+                 f"(поріг {pos.get('rr_floor')})")
+
+    # ── ІСТОРИЧНИЙ РЕПЛЕЙ (головна діагностика) ─────────────
+    line("\n" + "=" * 64)
+    line("РЕПЛЕЙ ІСТОРІЇ — скільки сетапів дав ринок нещодавно:")
+    line("=" * 64)
+    total_exec = scan_history(dfs, SYMBOL, scan_bars=scan_bars)
+
+    line("\n" + "=" * 64)
+    if total_exec and total_exec > 0:
+        line(f"ВИСНОВОК: ринок ДАВАВ ~{total_exec} відкриваних сетапів за вікно.")
+        line("Отже сигнали Є, а угод у боті немає → проблема у ВИКОНАННІ:")
+        line("  1) OB-фільтр стіни ріже вхід  → лог 'велика стіна проти'")
+        line("  2) помилка ордера / маржі      → лог 'Помилка виконання ордера'")
+        line("  3) позиція замала              → лог 'Позиція неможлива'")
+        line("  4) бот на паузі / не той код   → перевір, що задеплоєна нова версія")
+        line("Грепни лог: grep -E 'стіна|Помилка викон|Позиція немож|floor' logs/*.log")
+    elif any_signal:
+        line("ВИСНОВОК: зараз сигнал Є, але за вікно реплею відкриваних мало.")
+        line("Ринок на межі порогів. Дивись ❌ вище і лог бота на виконання.")
+    else:
+        line("ВИСНОВОК: ринок майже НЕ давав сетапів (тихо / жорсткі пороги).")
+        line("Це і є причина 0 угод. Дивись ❌ вище — які саме пороги не дотягли,")
+        line("і пом'якш їх у settings (min_width_pct / k_band / min_dev_pct / adx_min).")
+    line("=" * 64)
+
+
+if __name__ == "__main__":
+    main()

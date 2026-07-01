@@ -326,12 +326,13 @@ USE_DUAL_TF_STRATEGY = os.getenv("USE_DUAL_TF_STRATEGY", "false").lower() == "tr
 USE_ORDER_BOOK_CONFIRMATION = os.getenv("USE_ORDER_BOOK_CONFIRMATION", "false").lower() == "true"
 
 # Але стіну проти входу краще залишити як hard-filter
-USE_ORDER_BOOK_WALL_FILTER = os.getenv("USE_ORDER_BOOK_WALL_FILTER", "true").lower() == "true"
+USE_ORDER_BOOK_WALL_FILTER = os.getenv("USE_ORDER_BOOK_WALL_FILTER", "false").lower() == "false"
+
 
 
 # ═══════════════════════════════════════════════════════════════
 # CVD / ORDER FLOW
-# ═══════════════════════════════════════════════════════════════
+# ════════════════════════════════════
 
 CVD_LOOKBACK            = int(os.getenv("CVD_LOOKBACK",   3))
 OF_DELTA_LOOKBACK       = int(os.getenv("OF_DELTA_LOOKBACK", 3))
