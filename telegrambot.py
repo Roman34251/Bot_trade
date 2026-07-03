@@ -455,6 +455,36 @@ def fmt_diagnostic(trader: LiveTrader, scan_bars: int = 120) -> str:
     price = float(df5["close"].iloc[-1])
     L = ["*🔬 ДІАГНОСТИКА*", f"BTC = `{price:.1f}`  |  пріоритет `{','.join(STRATEGY_PRIORITY)}`", ""]
 
+    # ── Свіжість даних (КРИТИЧНО: ціна вище — з буферів бота; якщо вони
+    #    замерзли, все нижче — про СТАРИЙ ринок) ─────────────────────────
+    def _age_str(sec: float) -> str:
+        if sec < 120:
+            return f"{int(sec)}с"
+        if sec < 7200:
+            return f"{int(sec/60)}хв"
+        return f"{sec/3600:.1f}год"
+
+    now_ts = datetime.now(timezone.utc).timestamp()
+    limits = {"1m": 240, "5m": 900, "1h": 7500}
+    ages, stale = [], False
+    for tf in ["1m", "5m", "1h"]:
+        d = dfs.get(tf)
+        if d is None or len(d) == 0:
+            ages.append(f"{tf} `нема` ❌")
+            stale = True
+            continue
+        sec = max(0.0, now_ts - d.index[-1].timestamp())
+        bad = sec > limits[tf]
+        stale = stale or bad
+        ages.append(f"{tf} `{_age_str(sec)}`" + (" ❌" if bad else ""))
+    L.append("свіжість свічок: " + " | ".join(ages))
+    if stale:
+        L += ["", "🛑 *ДАНІ ЗАМЕРЗЛИ — бот бачить СТАРУ ціну!*",
+              "_WS мертвий або бот давно не перезапускався._",
+              "_Перезапусти бота і перевір /diag ще раз._", ""]
+    else:
+        L.append("")
+
     mr = cfg.get("meanrev", {})
     if mr.get("enabled"):
         bb = bollinger_bands(df5["close"], int(mr.get("bb_period", 20)), float(mr.get("bb_std", 2.0)))

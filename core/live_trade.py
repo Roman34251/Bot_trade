@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -172,6 +173,12 @@ class LiveTrader:
         # Усі виклики йдуть через self._notify() і НІКОЛИ не ламають торгівлю.
         self.notifier = None
 
+        # Самолікування замерзлих даних (див. _ensure_fresh_data).
+        # -1e9, а не 0: time.monotonic() на свіжому сервері стартує біля 0,
+        # і 0.0 заблокувала б ПЕРШЕ перезавантаження тротлінгом.
+        self._last_data_refresh = -1e9
+        self._last_stale_alert  = -1e9
+
         self.state = LiveState(
             equity  = Decimal(str(self._real_balance)),
             deposit = Decimal(str(self._real_balance)),
@@ -260,6 +267,16 @@ class LiveTrader:
         self._running = True
         self.ws = await self._connect_ws()
 
+        # Прогрів маркетів для торгового REST (demo-endpoint): беремо
+        # довідник інструментів з mainnet і віддаємо demo-інстансу, щоб
+        # перший create_order не залежав від load_markets на api-demo.
+        try:
+            mkts = self.market.load_markets()
+            self.rest.set_markets(mkts)
+            logger.info(f"✅ Markets warmup: {len(mkts)} інструментів")
+        except Exception as e:
+            logger.warning(f"Markets warmup не вдався (не критично): {e}")
+
         await self._load_initial_candles()
 
         tasks = []
@@ -313,15 +330,16 @@ class LiveTrader:
             try:
                 async with websockets.connect(
                     url,
-                    ping_interval = None,
-                    ping_timeout  = None,
+                    # див. коментар у _stream_candles: захист від zombie-з'єднань
+                    ping_interval = 20,
+                    ping_timeout  = 15,
                     close_timeout = 10,
                     open_timeout  = 10,
                 ) as ws:
                     await ws.send(sub_msg)
                     full_bids.clear()
                     full_asks.clear()
- 
+
                     keepalive = asyncio.create_task(
                         self._bybit_keepalive(ws, f"OB {symbol}")
                     )
@@ -347,12 +365,16 @@ class LiveTrader:
                         else:
                             logger.warning(f"OB несподіваний перший меседж: {first}")
  
+                        last_msg = time.monotonic()
                         while self._running:
                             try:
                                 raw = await asyncio.wait_for(ws.recv(), timeout=30)
                             except asyncio.TimeoutError:
+                                if time.monotonic() - last_msg > 90:
+                                    raise ConnectionError("OB WS: тиша >90с — force reconnect")
                                 continue
- 
+                            last_msg = time.monotonic()
+
                             data     = json.loads(raw)
                             msg_type = data.get("type")
                             topic    = data.get("topic", "")
@@ -424,21 +446,26 @@ class LiveTrader:
             try:
                 async with websockets.connect(
                     url,
-                    ping_interval = None,
-                    ping_timeout  = None,
+                    # ФІКС «замерзлих свічок»: раніше ping_interval=None вимикав
+                    # протокольні пінги, а TimeoutError нижче ковтався через
+                    # continue → мертве (zombie) з'єднання крутилось вічно і
+                    # свічки не оновлювались ДНЯМИ. Тепер бібліотека сама
+                    # детектить мертвий TCP і рве з'єднання → reconnect.
+                    ping_interval = 20,
+                    ping_timeout  = 15,
                     close_timeout = 10,
                     open_timeout  = 10,
                 ) as ws:
                     await ws.send(sub_msg)
- 
+
                     keepalive = asyncio.create_task(
                         self._bybit_keepalive(ws, f"Candles {symbol} {tf}")
                     )
- 
+
                     try:
                         first_raw = await asyncio.wait_for(ws.recv(), timeout=10)
                         first     = json.loads(first_raw)
- 
+
                         if first.get("op") == "subscribe" and first.get("success"):
                             logger.info(f"✅ Candles WebSocket: {symbol} {tf}")
                         elif first.get("op") == "pong":
@@ -448,13 +475,19 @@ class LiveTrader:
                                 f"✅ Candles WebSocket: {symbol} {tf} "
                                 f"| first={first.get('op') or first.get('type')}"
                             )
- 
+
+                        last_msg = time.monotonic()
                         while self._running:
                             try:
                                 raw = await asyncio.wait_for(ws.recv(), timeout=30)
                             except asyncio.TimeoutError:
+                                # Kline-топік шле апдейти щосекунди, keepalive-pong
+                                # кожні 20с. 90с повної тиші = зомбі → reconnect.
+                                if time.monotonic() - last_msg > 90:
+                                    raise ConnectionError("kline WS: тиша >90с — force reconnect")
                                 continue
- 
+                            last_msg = time.monotonic()
+
                             data = json.loads(raw)
  
                             if data.get("op") == "pong":
@@ -479,11 +512,11 @@ class LiveTrader:
  
                     finally:
                         keepalive.cancel()
- 
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f"Candles WebSocket помилка {symbol} {tf}: {e}")
+                logger.warning(f"Candles WebSocket помилка {symbol} {tf}: {e} — reconnect за 5с")
                 await asyncio.sleep(5)
     # ── Торговий цикл ─────────────────────────────────────────
 
@@ -498,6 +531,9 @@ class LiveTrader:
 
                 now = datetime.now(timezone.utc)
                 self._check_daily_reset(now)
+
+                # Свіжість даних: замерзлі свічки → REST-перезавантаження
+                await self._ensure_fresh_data()
 
                 # Моніторинг відкритої позиції
                 if self.state.open_trade:
@@ -561,6 +597,15 @@ class LiveTrader:
           4. generate_dual_tf_signal() — якщо A не дав
           5. OB підтвердження: дисбаланс + відсутність стіни
         """
+        # НЕ торгуємо на замерзлих даних: рішення по старій ціні = сліпі угоди.
+        age_1m = self._last_candle_age_sec(symbol, "1m")
+        if age_1m is None or age_1m > self.STALE_1M_SEC:
+            logger.warning(
+                f"{symbol}: 1m свічки протухли "
+                f"({'нема' if age_1m is None else str(int(age_1m)) + 'с'}) — сигнали пропущено"
+            )
+            return None
+
         df_1h  = self._get_df(symbol, "1h")
         df_30m = self._get_df(symbol, "30m")
         df_5m  = self._get_df(symbol, "5m")
@@ -747,40 +792,80 @@ class LiveTrader:
             f"risk=${pos['risk_usdt']} RR={pos['rr_ratio']}"
         )
 
+        # ── Вхід ────────────────────────────────────────────
+        # Шлях 1 (основний): ОДИН маркет-ордер із прикріпленими TP/SL
+        # (Bybit v5: takeProfit/stopLoss/tpslMode прямо у create order).
+        # Це атомарно: або є позиція З захистом, або нічого.
+        # Старий шлях (3 окремі ордери, SL через stopPrice+orderType="Stop")
+        # Bybit v5 нерідко відхиляє (retCode 10001) → весь try падав у
+        # except і угоди «зникали» мовчки.
+        tp_side = "sell" if direction == "long" else "buy"
+        order = None
+        tpsl_attached = False
+
         try:
             order = self.rest.create_order(
                 symbol = symbol,
                 type   = "market",
                 side   = side,
                 amount = qty,
-                params = {"positionIdx": 0},
+                params = {
+                    "positionIdx": 0,
+                    "takeProfit":  float(tp),
+                    "stopLoss":    float(sl),
+                    "tpslMode":    "Full",
+                    "tpOrderType": "Market",
+                    "slOrderType": "Market",
+                },
             )
+            tpsl_attached = True
+        except Exception as e:
+            logger.warning(f"Атомарний вхід із TP/SL відхилено: {e} — пробую роздільний шлях")
+
+        # Шлях 2 (fallback): чистий вхід + окремі TP/SL з коректними v5-параметрами
+        if order is None:
+            try:
+                order = self.rest.create_order(
+                    symbol = symbol, type = "market", side = side, amount = qty,
+                    params = {"positionIdx": 0},
+                )
+            except Exception as e:
+                logger.error(f"❌ ВХІДНИЙ ордер відхилено біржею: {type(e).__name__}: {e}")
+                await self._notify(
+                    "send_alert",
+                    f"❌ *Ордер відхилено біржею*\n"
+                    f"{side.upper()} {qty} {symbol}\n`{e}`",
+                )
+                return
+
+        try:
             logger.info(
                 f"✅ Ордер виконано: id={order['id']} | "
                 f"filled={order.get('filled', qty)} | "
-                f"price={order.get('average', 'market')}"
+                f"price={order.get('average') or 'market'} | "
+                f"tpsl_attached={tpsl_attached}"
             )
 
-            real_entry = float(order.get("average", signal["entry"]))
-            tp_side    = "sell" if direction == "long" else "buy"
+            real_entry = float(order.get("average") or signal["entry"])
 
-            # Take Profit
-            self.rest.create_order(
-                symbol = symbol, type = "limit", side = tp_side, amount = qty,
-                price  = float(tp),
-                params = {"reduceOnly": True, "timeInForce": "GTC"},
-            )
-
-            # Stop Loss
-            self.rest.create_order(
-                symbol = symbol, type = "market", side = tp_side, amount = qty,
-                params = {
-                    "reduceOnly":   True,
-                    "stopPrice":    float(sl),
-                    "triggerPrice": float(sl),
-                    "orderType":    "Stop",
-                },
-            )
+            if not tpsl_attached:
+                # TP: reduceOnly limit
+                self.rest.create_order(
+                    symbol = symbol, type = "limit", side = tp_side, amount = qty,
+                    price  = float(tp),
+                    params = {"reduceOnly": True, "timeInForce": "GTC", "positionIdx": 0},
+                )
+                # SL: умовний маркет. triggerDirection обов'язковий у v5:
+                # 2 = спрацьовує при ПАДІННІ ціни (SL лонга), 1 = при ЗРОСТАННІ (SL шорта)
+                self.rest.create_order(
+                    symbol = symbol, type = "market", side = tp_side, amount = qty,
+                    params = {
+                        "reduceOnly":       True,
+                        "triggerPrice":     float(sl),
+                        "triggerDirection": 2 if direction == "long" else 1,
+                        "positionIdx":      0,
+                    },
+                )
 
             logger.info(f"✅ TP={float(tp):.4f} SL={float(sl):.4f} встановлено")
 
@@ -829,7 +914,25 @@ class LiveTrader:
             # TODO: log_trade_open(trade_record)  ← підключимо в наступному кроці
 
         except Exception as e:
-            logger.error(f"❌ Помилка виконання ордера: {e}")
+            # Сюди потрапляємо ПІСЛЯ виконаного входу (TP/SL або запис впали).
+            # Незахищена позиція неприпустима → закриваємо негайно маркетом.
+            logger.error(f"❌ Помилка після входу (TP/SL/запис): {e} — екстрено закриваю позицію")
+            await self._notify(
+                "send_alert",
+                f"⚠️ *Позиція відкрилась, але TP/SL не виставились — закриваю!*\n`{e}`",
+            )
+            try:
+                self.rest.create_order(
+                    symbol = symbol, type = "market", side = tp_side, amount = qty,
+                    params = {"reduceOnly": True, "positionIdx": 0},
+                )
+                logger.info("✅ Незахищену позицію закрито")
+            except Exception as e2:
+                logger.critical(f"🆘 НЕ ВДАЛОСЬ закрити незахищену позицію: {e2}")
+                await self._notify(
+                    "send_alert",
+                    f"🆘 *ЗАКРИЙ ПОЗИЦІЮ {symbol} ВРУЧНУ НА BYBIT!*\n`{e2}`",
+                )
 
     # ── Моніторинг позиції ────────────────────────────────────
 
@@ -896,6 +999,52 @@ class LiveTrader:
             self.state.open_trade = None
 
     # ── Допоміжні методи ──────────────────────────────────────
+
+    def _last_candle_age_sec(self, symbol: str, tf: str) -> Optional[float]:
+        """Вік останньої свічки в секундах (None — буфер порожній)."""
+        buf = self.state.candles.get(f"{symbol}_{tf}")
+        if not buf:
+            return None
+        last_ts_ms = float(buf[-1][0])
+        return max(0.0, datetime.now(timezone.utc).timestamp() - last_ts_ms / 1000.0)
+
+    # Порог свіжості 1m: закрита свічка стартує на ~60-120с позаду "зараз",
+    # тож здорові дані мають вік < ~180с. 240с = точно щось не так.
+    STALE_1M_SEC    = 240
+    REFRESH_MIN_SEC = 300    # REST-перезавантаження не частіше, ніж раз на 5 хв
+    ALERT_MIN_SEC   = 1800   # алерт у TG не частіше, ніж раз на 30 хв
+
+    async def _ensure_fresh_data(self) -> None:
+        """
+        Якщо 1m свічки протухли (WS мовчить) — перезавантажуємо ВСІ буфери
+        через REST (mainnet) і алертимо в Telegram. Це страховка поверх
+        WS-вотчдогів: бот ніколи більше не «живе» днями на замерзлій ціні.
+        """
+        worst = 0.0
+        for symbol in TRADING_PAIRS:
+            age = self._last_candle_age_sec(symbol, "1m")
+            if age is None or age > self.STALE_1M_SEC:
+                worst = max(worst, age or 9e9)
+
+        if worst == 0.0:
+            return
+
+        now_mono = time.monotonic()
+        if now_mono - self._last_data_refresh >= self.REFRESH_MIN_SEC:
+            self._last_data_refresh = now_mono
+            logger.warning(
+                f"🩹 1m дані протухли ({int(min(worst, 9e8))}с) — "
+                f"перезавантажую свічки через REST"
+            )
+            await self._load_initial_candles()
+
+        if now_mono - self._last_stale_alert >= self.ALERT_MIN_SEC:
+            self._last_stale_alert = now_mono
+            await self._notify(
+                "send_alert",
+                "🩹 *Свічки протухали — перезавантажив через REST.*\n"
+                "Якщо це повторюється часто — перевір мережу сервера.",
+            )
 
     async def _notify(self, method: str, *args) -> None:
         """
