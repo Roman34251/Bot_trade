@@ -36,7 +36,7 @@ from loguru import logger
 from config.settings import (
     TRADING_PAIRS, BYBIT_DEMO,
     ACTIVE_API_KEY, ACTIVE_API_SECRET,
-    DEPOSIT_USDT, RISK_PER_TRADE_PCT,
+    DEPOSIT_USDT, RISK_PER_TRADE_PCT, USE_REAL_BALANCE,
     MIN_RISK_REWARD, BYBIT_TAKER_FEE,
     COOLDOWN_AFTER_LOSS_MIN, MIN_CANDLES_BETWEEN_TRADES,
     OB_IMBALANCE_LONG_MIN, OB_IMBALANCE_SHORT_MAX,
@@ -149,6 +149,12 @@ class LiveState:
 
     candles: dict = field(default_factory=dict)  # "BTC/USDT:USDT_1h" → deque(200)
 
+    # LIVE-дані: Bybit пушить оновлення ПОТОЧНОЇ (незакритої) свічки кожні
+    # ~1-3с. Тримаємо їх окремо від закритих — бот бачить ціну в реальному
+    # часі, а не раз на закриту хвилину.
+    live_candles: dict = field(default_factory=dict)  # key → остання live-свічка
+    ws_msg_at:    dict = field(default_factory=dict)  # key → epoch останнього push'а
+
 
 # ── Головний клас ─────────────────────────────────────────────
 
@@ -178,6 +184,8 @@ class LiveTrader:
         # і 0.0 заблокувала б ПЕРШЕ перезавантаження тротлінгом.
         self._last_data_refresh = -1e9
         self._last_stale_alert  = -1e9
+        # Тротлінг алертів про відхилені ордери (1 на 10 хв; у лог — все)
+        self._last_reject_alert = -1e9
 
         self.state = LiveState(
             equity  = Decimal(str(self._real_balance)),
@@ -214,10 +222,25 @@ class LiveTrader:
                 api_key    = ACTIVE_API_KEY,
                 api_secret = ACTIVE_API_SECRET,
             )
+            self._pybit = session
             resp = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
             usdt = float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
-            logger.info(f"✅ Bybit підключено | USDT баланс: ${usdt:.2f}")
-            self._real_balance = usdt
+            # Капітал тягнемо З АКАУНТА (запит власника): USE_REAL_BALANCE=true
+            # → торгуємо від реального walletBalance USDT. DEPOSIT_USDT — лише
+            # fallback/фіксований режим.
+            if USE_REAL_BALANCE:
+                self._real_balance = usdt
+                logger.info(
+                    f"✅ Bybit підключено | капітал з акаунта: ${usdt:,.2f} "
+                    f"(ризик/угоду {RISK_PER_TRADE_PCT*100:.1f}% = "
+                    f"${usdt * RISK_PER_TRADE_PCT:,.2f})"
+                )
+            else:
+                self._real_balance = float(DEPOSIT_USDT)
+                logger.info(
+                    f"✅ Bybit підключено | баланс ${usdt:,.2f}, "
+                    f"торгуємо від фіксованих ${DEPOSIT_USDT:,.2f}"
+                )
         except Exception as e:
             logger.error(f"❌ Помилка підключення: {e}")
             raise
@@ -476,6 +499,11 @@ class LiveTrader:
                                 f"| first={first.get('op') or first.get('type')}"
                             )
 
+                        # Після (пере)підключення докачуємо пропущені закриті
+                        # свічки через REST — обриви мережі Oracle не лишають
+                        # дірок в історії.
+                        self._backfill_candles(symbol, tf)
+
                         last_msg = time.monotonic()
                         while self._running:
                             try:
@@ -495,20 +523,25 @@ class LiveTrader:
  
                             if data.get("topic", "").startswith("kline"):
                                 for candle in data.get("data", []):
-                                    if candle.get("confirm", False):
-                                        c = [
-                                            int(candle["start"]),
-                                            float(candle["open"]),
-                                            float(candle["high"]),
-                                            float(candle["low"]),
-                                            float(candle["close"]),
-                                            float(candle["volume"]),
-                                        ]
-                                        if key in self.state.candles:
-                                            self.state.candles[key].append(c)
-                                            logger.debug(
-                                                f"Нова {symbol} {tf}: close={c[4]:.4f} vol={c[5]:.2f}"
-                                            )
+                                    c = [
+                                        int(candle["start"]),
+                                        float(candle["open"]),
+                                        float(candle["high"]),
+                                        float(candle["low"]),
+                                        float(candle["close"]),
+                                        float(candle["volume"]),
+                                    ]
+                                    # LIVE: кожен пуш (~1-3с) оновлює поточну
+                                    # свічку — стратегії бачать ціну в реальному
+                                    # часі, а не з запізненням до 60с.
+                                    self.state.live_candles[key] = c
+                                    self.state.ws_msg_at[key] = datetime.now(timezone.utc).timestamp()
+
+                                    if candle.get("confirm", False) and key in self.state.candles:
+                                        self.state.candles[key].append(c)
+                                        logger.debug(
+                                            f"Закрита {symbol} {tf}: close={c[4]:.4f} vol={c[5]:.2f}"
+                                        )
  
                     finally:
                         keepalive.cancel()
@@ -576,7 +609,9 @@ class LiveTrader:
                         await self._execute_trade(signal)
                         break
 
-                await asyncio.sleep(15)
+                # 3с: live-свічки оновлюються кожні ~1-3с (пуш Bybit),
+                # тож повна реакція бота на рух ціни ≤ ~3-6 секунд.
+                await asyncio.sleep(3)
 
             except asyncio.CancelledError:
                 break
@@ -598,11 +633,16 @@ class LiveTrader:
           5. OB підтвердження: дисбаланс + відсутність стіни
         """
         # НЕ торгуємо на замерзлих даних: рішення по старій ціні = сліпі угоди.
-        age_1m = self._last_candle_age_sec(symbol, "1m")
-        if age_1m is None or age_1m > self.STALE_1M_SEC:
+        # Свіжо = live-потік пушить (≤60с) АБО закриті свічки актуальні (≤180с,
+        # напр. після REST-самолікування, коли WS тимчасово мертвий).
+        ws_age = self._ws_age_sec(symbol, "1m")
+        candle_age = self._last_candle_age_sec(symbol, "1m")
+        live_ok = ws_age is not None and ws_age <= 60
+        rest_ok = candle_age is not None and candle_age <= 180
+        if not (live_ok or rest_ok):
             logger.warning(
-                f"{symbol}: 1m свічки протухли "
-                f"({'нема' if age_1m is None else str(int(age_1m)) + 'с'}) — сигнали пропущено"
+                f"{symbol}: дані протухли (live={ws_age and int(ws_age)}с, "
+                f"closed={candle_age and int(candle_age)}с) — сигнали пропущено"
             )
             return None
 
@@ -831,11 +871,16 @@ class LiveTrader:
                 )
             except Exception as e:
                 logger.error(f"❌ ВХІДНИЙ ордер відхилено біржею: {type(e).__name__}: {e}")
-                await self._notify(
-                    "send_alert",
-                    f"❌ *Ордер відхилено біржею*\n"
-                    f"{side.upper()} {qty} {symbol}\n`{e}`",
-                )
+                # Тротлінг: та сама помилка повторюється кожен цикл (напр.
+                # retCode 10005 permission denied) → 1 алерт на 10 хв, не спам.
+                now_mono = time.monotonic()
+                if now_mono - self._last_reject_alert >= 600:
+                    self._last_reject_alert = now_mono
+                    await self._notify(
+                        "send_alert",
+                        f"❌ *Ордер відхилено біржею*\n"
+                        f"{side.upper()} {qty} {symbol}\n`{e}`",
+                    )
                 return
 
         try:
@@ -975,6 +1020,13 @@ class LiveTrader:
             self.state.equity    += Decimal(str(pnl))
             self.state.daily_pnl += Decimal(str(pnl))
 
+            # Ресинк капіталу з РЕАЛЬНИМ акаунтом після кожної закритої угоди —
+            # внутрішня оцінка PnL не «розпливається» від фактичного балансу.
+            if USE_REAL_BALANCE:
+                real = self._fetch_real_balance()
+                if real is not None:
+                    self.state.equity = Decimal(str(real))
+
             result = "✅ PROFIT" if pnl > 0 else "❌ LOSS"
             logger.info(
                 f"{result} | {trade['direction'].upper()} {trade['symbol']} | "
@@ -1000,13 +1052,50 @@ class LiveTrader:
 
     # ── Допоміжні методи ──────────────────────────────────────
 
+    def _fetch_real_balance(self) -> Optional[float]:
+        """Свіжий walletBalance USDT з акаунта (None — якщо API недоступний)."""
+        try:
+            if getattr(self, "_pybit", None) is None:
+                return None
+            resp = self._pybit.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+            return float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
+        except Exception as e:
+            logger.debug(f"Не вдалось оновити баланс з акаунта: {e}")
+            return None
+
     def _last_candle_age_sec(self, symbol: str, tf: str) -> Optional[float]:
-        """Вік останньої свічки в секундах (None — буфер порожній)."""
+        """Вік останньої ЗАКРИТОЇ свічки (від її START; для 1m здорово 60-125с)."""
         buf = self.state.candles.get(f"{symbol}_{tf}")
         if not buf:
             return None
         last_ts_ms = float(buf[-1][0])
         return max(0.0, datetime.now(timezone.utc).timestamp() - last_ts_ms / 1000.0)
+
+    def _ws_age_sec(self, symbol: str, tf: str) -> Optional[float]:
+        """Секунд від останнього live-пуша WS (здорово ≤3с)."""
+        ts = self.state.ws_msg_at.get(f"{symbol}_{tf}")
+        if ts is None:
+            return None
+        return max(0.0, datetime.now(timezone.utc).timestamp() - ts)
+
+    def _backfill_candles(self, symbol: str, tf: str) -> None:
+        """Докачує закриті свічки через REST (mainnet) і зливає в буфер по ts."""
+        key = f"{symbol}_{tf}"
+        try:
+            raw = self.market.fetch_ohlcv(symbol, tf, limit=100)
+        except Exception as e:
+            logger.debug(f"Backfill {key} не вдався: {e}")
+            return
+        buf = self.state.candles.get(key)
+        if buf is None:
+            self.state.candles[key] = deque(raw, maxlen=self.CANDLE_BUFFER)
+            return
+        merged = {int(c[0]): list(c) for c in buf}
+        for c in raw:
+            merged[int(c[0])] = list(c)
+        ordered = [merged[k] for k in sorted(merged)]
+        self.state.candles[key] = deque(ordered[-self.CANDLE_BUFFER:], maxlen=self.CANDLE_BUFFER)
+        logger.debug(f"Backfill {key}: {len(raw)} свічок злито, буфер {len(self.state.candles[key])}")
 
     # Порог свіжості 1m: закрита свічка стартує на ~60-120с позаду "зараз",
     # тож здорові дані мають вік < ~180с. 240с = точно щось не так.
@@ -1068,8 +1157,15 @@ class LiveTrader:
         if not buf or len(buf) < 10:
             return None
 
+        rows = list(buf)
+        # Поточна (незакрита) свічка — ОСТАННІМ рядком: стратегії реагують
+        # на живу ціну (оновлення ~1-3с), а не чекають закриття хвилини.
+        live = self.state.live_candles.get(key)
+        if live is not None and int(live[0]) >= int(rows[-1][0]):
+            rows.append(list(live))
+
         df = pd.DataFrame(
-            list(buf),
+            rows,
             columns=["timestamp", "open", "high", "low", "close", "volume"]
         )
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)

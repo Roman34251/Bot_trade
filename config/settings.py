@@ -209,10 +209,9 @@ BYBIT_HISTORY_MONTHS = {
 
 BYBIT_API_KEY    = os.getenv("BYBIT_API_KEY",    "")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
-BYBIT_DEMO_KEY   = os.getenv("BYBIT_DEMO_KEY",   "")
+BYBIT_DEMO_KEY   = os.getenv("BYBIT_DEMO_KEY",   "omXkRhiVG0mLSiLYrJ")
 BYBIT_DEMO_SECRET = os.getenv("BYBIT_DEMO_SECRET", "")
-BYBIT_DEMO       = os.getenv("BYBIT_DEMO", "false").lower() == "true"
-
+BYBIT_DEMO       = os.getenv("BYBIT_DEMO", "true").lower() == "true"
 ACTIVE_API_KEY    = BYBIT_DEMO_KEY    if BYBIT_DEMO else BYBIT_API_KEY
 ACTIVE_API_SECRET = BYBIT_DEMO_SECRET if BYBIT_DEMO else BYBIT_API_SECRET
 
@@ -241,6 +240,9 @@ BREAKEVEN_PCT = {
 # ACCOUNT / RISK
 # ═══════════════════════════════════════════════════════════════
 
+# Капітал тягнеться з акаунта через API (walletBalance USDT). DEPOSIT_USDT —
+# лише fallback, якщо API недоступний, або якщо USE_REAL_BALANCE=false.
+USE_REAL_BALANCE      = os.getenv("USE_REAL_BALANCE", "true").lower() == "true"
 DEPOSIT_USDT          = float(os.getenv("DEPOSIT_USDT",          500))
 RISK_PER_TRADE_PCT    = float(os.getenv("RISK_PER_TRADE_PCT",    0.01))
 RISK_PER_TRADE_USDT   = DEPOSIT_USDT * RISK_PER_TRADE_PCT
@@ -326,13 +328,12 @@ USE_DUAL_TF_STRATEGY = os.getenv("USE_DUAL_TF_STRATEGY", "false").lower() == "tr
 USE_ORDER_BOOK_CONFIRMATION = os.getenv("USE_ORDER_BOOK_CONFIRMATION", "false").lower() == "true"
 
 # Але стіну проти входу краще залишити як hard-filter
-USE_ORDER_BOOK_WALL_FILTER = os.getenv("USE_ORDER_BOOK_WALL_FILTER", "false").lower() == "false"
-
+USE_ORDER_BOOK_WALL_FILTER = os.getenv("USE_ORDER_BOOK_WALL_FILTER", "true").lower() == "true"
 
 
 # ═══════════════════════════════════════════════════════════════
 # CVD / ORDER FLOW
-# ════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 
 CVD_LOOKBACK            = int(os.getenv("CVD_LOOKBACK",   3))
 OF_DELTA_LOOKBACK       = int(os.getenv("OF_DELTA_LOOKBACK", 3))

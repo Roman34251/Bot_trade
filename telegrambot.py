@@ -465,23 +465,39 @@ def fmt_diagnostic(trader: LiveTrader, scan_bars: int = 120) -> str:
         return f"{sec/3600:.1f}год"
 
     now_ts = datetime.now(timezone.utc).timestamp()
+
+    # LIVE-потік: епоха останнього WS-пуша поточної свічки (здорово ≤3с)
+    ws_at = getattr(trader.state, "ws_msg_at", {}) or {}
+    live_ts = ws_at.get(f"{_DIAG_SYMBOL}_1m")
+    live_age = None if live_ts is None else max(0.0, now_ts - live_ts)
+    if live_age is not None and live_age <= 30:
+        L.append(f"live-потік: `{_age_str(live_age)}` ✅ (ціна вище — реального часу)")
+        live_dead = False
+    else:
+        L.append(f"live-потік: `{'нема' if live_age is None else _age_str(live_age)}` ❌")
+        live_dead = True
+
+    # Закриті свічки (вік від СТАРТУ останньої закритої: 1m здорово 60-125с)
     limits = {"1m": 240, "5m": 900, "1h": 7500}
-    ages, stale = [], False
+    ages, closed_stale = [], False
     for tf in ["1m", "5m", "1h"]:
         d = dfs.get(tf)
         if d is None or len(d) == 0:
             ages.append(f"{tf} `нема` ❌")
-            stale = True
+            closed_stale = True
             continue
         sec = max(0.0, now_ts - d.index[-1].timestamp())
         bad = sec > limits[tf]
-        stale = stale or bad
+        closed_stale = closed_stale or bad
         ages.append(f"{tf} `{_age_str(sec)}`" + (" ❌" if bad else ""))
-    L.append("свіжість свічок: " + " | ".join(ages))
-    if stale:
+    L.append("закриті свічки: " + " | ".join(ages))
+
+    if live_dead and closed_stale:
         L += ["", "🛑 *ДАНІ ЗАМЕРЗЛИ — бот бачить СТАРУ ціну!*",
               "_WS мертвий або бот давно не перезапускався._",
               "_Перезапусти бота і перевір /diag ще раз._", ""]
+    elif live_dead:
+        L += ["", "🩹 _live-потік мовчить — працюю по закритих свічках (REST)._", ""]
     else:
         L.append("")
 
