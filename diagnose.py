@@ -156,6 +156,64 @@ def scan_history(dfs, symbol, scan_bars=180):
     return total_exec
 
 
+def test_websocket(seconds: int = 12) -> None:
+    """
+    Прямий тест WS до Bybit З ЦЬОГО СЕРВЕРА: підключаємось до
+    stream.bybit.com, підписуємось на kline.1.BTCUSDT і рахуємо пуші.
+    Якщо пуші йдуть — мережа ОК і проблему треба шукати в боті (/diag →
+    'WS-потоки' покаже точну помилку). Якщо ні — мережа сервера ріже WS.
+    """
+    import asyncio
+    import json as _json
+    try:
+        import websockets
+        line(f"   websockets version: {getattr(websockets, '__version__', '?')}")
+    except ImportError:
+        line("   ❌ websockets не встановлено:")
+        line("      python3.11 -m pip install 'websockets>=12,<13'")
+        return
+
+    async def _run():
+        url = "wss://stream.bybit.com/v5/public/linear"
+        total = kline = 0
+        try:
+            ws = await asyncio.wait_for(
+                websockets.connect(url, ping_interval=None, ping_timeout=None),
+                timeout=15,
+            )
+        except Exception as e:
+            line(f"   ❌ WS НЕ ПІДКЛЮЧАЄТЬСЯ: {type(e).__name__}: {e}")
+            line("      → мережа сервера блокує WebSocket до stream.bybit.com")
+            line("      → перевір: curl -sI https://stream.bybit.com | head -1")
+            return
+        try:
+            await ws.send(_json.dumps({"op": "subscribe", "args": ["kline.1.BTCUSDT"]}))
+            loop = asyncio.get_event_loop()
+            end = loop.time() + seconds
+            while loop.time() < end:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                except asyncio.TimeoutError:
+                    continue
+                total += 1
+                if "kline" in raw:
+                    kline += 1
+        finally:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        if kline > 0:
+            line(f"   ✅ WS ЖИВИЙ: за {seconds}с прийшло {kline} kline-пушів (всього {total} msg)")
+            line("      → мережа ОК. Якщо бот все одно морозить дані —")
+            line("        дивись /diag розділ 'WS-потоки': там текст помилки бота")
+        else:
+            line(f"   ⚠️ WS підключився, але kline-пушів НЕМА (msg={total})")
+            line("      → підписка не працює; надішли цей вивід у чат")
+
+    asyncio.run(_run())
+
+
 def main():
     scan_bars = 180
     if len(sys.argv) > 1:
@@ -174,6 +232,11 @@ def main():
         except Exception as e:
             line(f"   ❌ {tf}: {e}")
             dfs[tf] = None
+
+    line("\n" + "=" * 64)
+    line("ТЕСТ WEBSOCKET (чи пропускає мережа сервера live-потік):")
+    line("=" * 64)
+    test_websocket(seconds=12)
 
     cfg = SYMBOL_CONFIG.get(SYMBOL, {})
     price = dfs["5m"]["close"].iloc[-1]

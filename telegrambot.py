@@ -501,6 +501,21 @@ def fmt_diagnostic(trader: LiveTrader, scan_bars: int = 120) -> str:
     else:
         L.append("")
 
+    # ── Стан WS-потоків: ТОЧНА причина, якщо щось не підключається ──
+    ws_status = getattr(trader.state, "ws_status", {}) or {}
+    if ws_status:
+        L.append("*WS-потоки (conn/msgs):*")
+        for k in sorted(ws_status):
+            st = ws_status[k]
+            name = k.split("_")[-1]
+            icon = "🟢" if st.get("connected") else "🔴"
+            L.append(f"  {icon} `{name:<3}` {st.get('connects', 0)}/{st.get('msgs', 0)}")
+            if not st.get("connected") and st.get("last_error"):
+                L.append(f"      ⚠ `{st['last_error'][:90]}` о {st.get('last_error_at', '?')}")
+        L.append("")
+    else:
+        L += ["*WS-потоки:* `порожньо` — жоден потік ще не стартував ❗", ""]
+
     mr = cfg.get("meanrev", {})
     if mr.get("enabled"):
         bb = bollinger_bands(df5["close"], int(mr.get("bb_period", 20)), float(mr.get("bb_std", 2.0)))

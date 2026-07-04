@@ -155,6 +155,11 @@ class LiveState:
     live_candles: dict = field(default_factory=dict)  # key → остання live-свічка
     ws_msg_at:    dict = field(default_factory=dict)  # key → epoch останнього push'а
 
+    # Стан WS-потоків для діагностики: key → {connected, connects, msgs,
+    # last_error, last_error_at}. Показується у /diag — щоб причина обриву
+    # була видна одразу, без походу в логи сервера.
+    ws_status:    dict = field(default_factory=dict)
+
 
 # ── Головний клас ─────────────────────────────────────────────
 
@@ -353,13 +358,15 @@ class LiveTrader:
             try:
                 async with websockets.connect(
                     url,
-                    # див. коментар у _stream_candles: захист від zombie-з'єднань
-                    ping_interval = 20,
-                    ping_timeout  = 15,
+                    # ping_interval=None свідомо — див. коментар у _stream_candles
+                    # (захист від зомбі — вотчдог тиші, не протокольні пінги)
+                    ping_interval = None,
+                    ping_timeout  = None,
                     close_timeout = 10,
                     open_timeout  = 10,
                 ) as ws:
                     await ws.send(sub_msg)
+                    self._ws_note(f"{symbol}_OB", connected=True, inc_connects=True)
                     full_bids.clear()
                     full_asks.clear()
 
@@ -391,12 +398,13 @@ class LiveTrader:
                         last_msg = time.monotonic()
                         while self._running:
                             try:
-                                raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                                raw = await asyncio.wait_for(ws.recv(), timeout=25)
                             except asyncio.TimeoutError:
-                                if time.monotonic() - last_msg > 90:
-                                    raise ConnectionError("OB WS: тиша >90с — force reconnect")
+                                if time.monotonic() - last_msg > 75:
+                                    raise ConnectionError("OB WS: тиша >75с — force reconnect")
                                 continue
                             last_msg = time.monotonic()
+                            self._ws_note(f"{symbol}_OB", inc_msgs=True)
 
                             data     = json.loads(raw)
                             msg_type = data.get("type")
@@ -454,7 +462,9 @@ class LiveTrader:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f"OB WebSocket помилка {symbol}: {e} — перепідключення...")
+                err = f"{type(e).__name__}: {e}"
+                self._ws_note(f"{symbol}_OB", connected=False, error=err)
+                logger.warning(f"OB WebSocket {symbol}: {err} — перепідключення...")
                 full_bids.clear()
                 full_asks.clear()
                 await asyncio.sleep(5)
@@ -469,17 +479,19 @@ class LiveTrader:
             try:
                 async with websockets.connect(
                     url,
-                    # ФІКС «замерзлих свічок»: раніше ping_interval=None вимикав
-                    # протокольні пінги, а TimeoutError нижче ковтався через
-                    # continue → мертве (zombie) з'єднання крутилось вічно і
-                    # свічки не оновлювались ДНЯМИ. Тепер бібліотека сама
-                    # детектить мертвий TCP і рве з'єднання → reconnect.
-                    ping_interval = 20,
-                    ping_timeout  = 15,
+                    # ping_interval=None СВІДОМО: Bybit вимагає app-рівневий
+                    # {"op":"ping"} (наш keepalive шле його кожні 20с, сервер
+                    # відповідає pong-ПОВІДОМЛЕННЯМ = «пульс»). Протокольні
+                    # ping-фрейми сервер може ігнорувати — тоді бібліотека сама
+                    # вбивала б здорове з'єднання кожні ~35с. Захист від зомбі
+                    # (тихих обривів мережі Oracle) — вотчдог тиші нижче.
+                    ping_interval = None,
+                    ping_timeout  = None,
                     close_timeout = 10,
                     open_timeout  = 10,
                 ) as ws:
                     await ws.send(sub_msg)
+                    self._ws_note(key, connected=True, inc_connects=True)
 
                     keepalive = asyncio.create_task(
                         self._bybit_keepalive(ws, f"Candles {symbol} {tf}")
@@ -507,14 +519,16 @@ class LiveTrader:
                         last_msg = time.monotonic()
                         while self._running:
                             try:
-                                raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                                raw = await asyncio.wait_for(ws.recv(), timeout=25)
                             except asyncio.TimeoutError:
-                                # Kline-топік шле апдейти щосекунди, keepalive-pong
-                                # кожні 20с. 90с повної тиші = зомбі → reconnect.
-                                if time.monotonic() - last_msg > 90:
-                                    raise ConnectionError("kline WS: тиша >90с — force reconnect")
+                                # Kline-топік шле апдейти щосекунди, pong на наш
+                                # app-ping — кожні 20с. 75с повної тиші = зомбі
+                                # (мережа тихо вбила TCP) → force reconnect.
+                                if time.monotonic() - last_msg > 75:
+                                    raise ConnectionError("kline WS: тиша >75с — force reconnect")
                                 continue
                             last_msg = time.monotonic()
+                            self._ws_note(key, inc_msgs=True)
 
                             data = json.loads(raw)
  
@@ -549,7 +563,9 @@ class LiveTrader:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f"Candles WebSocket помилка {symbol} {tf}: {e} — reconnect за 5с")
+                err = f"{type(e).__name__}: {e}"
+                self._ws_note(key, connected=False, error=err)
+                logger.warning(f"Candles WebSocket {symbol} {tf}: {err} — reconnect за 5с")
                 await asyncio.sleep(5)
     # ── Торговий цикл ─────────────────────────────────────────
 
@@ -1052,6 +1068,24 @@ class LiveTrader:
 
     # ── Допоміжні методи ──────────────────────────────────────
 
+    def _ws_note(self, key: str, connected: Optional[bool] = None,
+                 inc_connects: bool = False, inc_msgs: bool = False,
+                 error: Optional[str] = None) -> None:
+        """Оновлює стан WS-потоку для /diag (без винятків, без блокувань)."""
+        st = self.state.ws_status.setdefault(
+            key, {"connected": False, "connects": 0, "msgs": 0,
+                  "last_error": None, "last_error_at": None},
+        )
+        if connected is not None:
+            st["connected"] = connected
+        if inc_connects:
+            st["connects"] += 1
+        if inc_msgs:
+            st["msgs"] += 1
+        if error is not None:
+            st["last_error"] = error[:160]
+            st["last_error_at"] = datetime.now(timezone.utc).strftime("%H:%M:%S")
+
     def _fetch_real_balance(self) -> Optional[float]:
         """Свіжий walletBalance USDT з акаунта (None — якщо API недоступний)."""
         try:
@@ -1100,7 +1134,8 @@ class LiveTrader:
     # Порог свіжості 1m: закрита свічка стартує на ~60-120с позаду "зараз",
     # тож здорові дані мають вік < ~180с. 240с = точно щось не так.
     STALE_1M_SEC    = 240
-    REFRESH_MIN_SEC = 300    # REST-перезавантаження не частіше, ніж раз на 5 хв
+    REFRESH_MIN_SEC = 120    # REST-перезавантаження до 1 разу на 2 хв: поки WS
+                             # лежить, дані лишаються торгівельно-придатними
     ALERT_MIN_SEC   = 1800   # алерт у TG не частіше, ніж раз на 30 хв
 
     async def _ensure_fresh_data(self) -> None:
