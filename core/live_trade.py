@@ -168,6 +168,15 @@ class LiveTrader:
     CANDLE_BUFFER    = 250   # ≥210 щоб EMA200 на 1h встигла "прогрітись" (трендова стратегія)
     RANGE_UPDATE_MIN = 60
 
+    # Мапа ТФ → інтервал Bybit v5 WS. КОРІНЬ «мовчазного live-потоку»:
+    # kline-топіки Bybit приймають ХВИЛИНИ ЧИСЛОМ (1/5/30/60/240) або D/W/M.
+    # "kline.1m..."/"kline.1h..." — НЕІСНУЮЧІ топіки: біржа приймала підписку
+    # і не слала НІЧОГО (тому OB працював, а свічки — ніколи).
+    WS_KLINE_INTERVAL = {
+        "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
+        "1h": "60", "2h": "120", "4h": "240", "1d": "D",
+    }
+
     def __init__(self):
         self._running     = False
         self._ob_lock     = threading.Lock()
@@ -472,7 +481,8 @@ class LiveTrader:
     async def _stream_candles(self, symbol: str, tf: str) -> None:
         ws_symbol = symbol.replace("/", "").replace(":USDT", "")
         url       = "wss://stream.bybit.com/v5/public/linear"
-        sub_msg   = json.dumps({"op": "subscribe", "args": [f"kline.{tf}.{ws_symbol}"]})
+        interval  = self.WS_KLINE_INTERVAL.get(tf, tf)   # "1m"→"1", "1h"→"60"
+        sub_msg   = json.dumps({"op": "subscribe", "args": [f"kline.{interval}.{ws_symbol}"]})
         key       = f"{symbol}_{tf}"
  
         while self._running:
@@ -501,15 +511,17 @@ class LiveTrader:
                         first_raw = await asyncio.wait_for(ws.recv(), timeout=10)
                         first     = json.loads(first_raw)
 
-                        if first.get("op") == "subscribe" and first.get("success"):
-                            logger.info(f"✅ Candles WebSocket: {symbol} {tf}")
-                        elif first.get("op") == "pong":
-                            logger.debug(f"Candles {symbol}: pong")
-                        else:
-                            logger.info(
-                                f"✅ Candles WebSocket: {symbol} {tf} "
-                                f"| first={first.get('op') or first.get('type')}"
+                        if first.get("op") == "subscribe" and not first.get("success", True):
+                            # Відхилена підписка (невалідний топік тощо) РАНІШЕ
+                            # логувалась як "✅" і потік вічно висів без даних.
+                            # Тепер — гучний фейл, видимий у /diag.
+                            raise ConnectionError(
+                                f"kline підписку відхилено: {first.get('ret_msg') or first}"
                             )
+                        logger.info(
+                            f"✅ Candles WebSocket: {symbol} {tf} "
+                            f"(kline.{interval}.{ws_symbol})"
+                        )
 
                         # Після (пере)підключення докачуємо пропущені закриті
                         # свічки через REST — обриви мережі Oracle не лишають

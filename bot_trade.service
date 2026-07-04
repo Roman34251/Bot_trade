@@ -1,0 +1,29 @@
+[Unit]
+Description=Bot_trade - Bybit trading bot + Telegram control
+# Стартуємо тільки коли мережа реально піднялась (важливо після ребута)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Bot_trade
+
+# ЄДИНИЙ процес: трейдер + Telegram разом (як ти й запускаєш вручну).
+# Шлях до python підставляє install_service.sh автоматично.
+ExecStart=/usr/bin/python3.11 /home/ubuntu/Bot_trade/telegrambot.py --demo
+
+# Перезапуск ЗАВЖДИ: після падіння, OOM, ребута Oracle — через 10 секунд.
+Restart=always
+RestartSec=10
+# Ніколи не "здаватись" після серії падінь (дефолт systemd відключає
+# сервіс після 5 падінь за 10с — нам таке не треба).
+StartLimitIntervalSec=0
+
+# Логи без буферизації → journalctl показує все одразу
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
