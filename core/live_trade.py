@@ -39,6 +39,7 @@ from config.settings import (
     DEPOSIT_USDT, RISK_PER_TRADE_PCT, USE_REAL_BALANCE,
     MIN_RISK_REWARD, BYBIT_TAKER_FEE,
     COOLDOWN_AFTER_LOSS_MIN, MIN_CANDLES_BETWEEN_TRADES,
+    MAX_CONSECUTIVE_LOSSES, COOLDOWN_AFTER_SERIES_MIN,
     OB_IMBALANCE_LONG_MIN, OB_IMBALANCE_SHORT_MAX,
     OB_MAX_AGE_SECONDS, OB_WALL_THRESHOLD_MULT, OB_WALL_BLOCK_PCT,
     USE_DUAL_TF_STRATEGY,
@@ -609,6 +610,19 @@ class LiveTrader:
 
                 # Свіжість даних: замерзлі свічки → REST-перезавантаження
                 await self._ensure_fresh_data()
+
+                # ФІКС ДЕДДОКУ серії збитків: streak скидався ЛИШЕ виграшем,
+                # але заблокований бот не торгує → не виграє → вічний стоп.
+                # Тепер після паузи COOLDOWN_AFTER_SERIES_MIN серія скидається.
+                if (self.state.loss_streak >= MAX_CONSECUTIVE_LOSSES
+                        and self.state.last_loss_time is not None):
+                    mins = (now - self.state.last_loss_time).total_seconds() / 60
+                    if mins >= COOLDOWN_AFTER_SERIES_MIN:
+                        logger.info(
+                            f"⏯ Серію з {self.state.loss_streak} збитків скинуто "
+                            f"після паузи {COOLDOWN_AFTER_SERIES_MIN} хв — торгуємо далі"
+                        )
+                        self.state.loss_streak = 0
 
                 # Моніторинг відкритої позиції
                 if self.state.open_trade:
