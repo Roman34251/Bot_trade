@@ -41,6 +41,7 @@ from config.settings import LOG_LEVEL, LOG_ROTATION, LOG_RETENTION
 from decimal import Decimal
 from config.settings import (
     SYMBOL_CONFIG, STRATEGY_PRIORITY, DEPOSIT_USDT, RISK_PER_TRADE_PCT,
+    USE_ORDER_BOOK_WALL_FILTER, USE_ORDER_BOOK_CONFIRMATION,
 )
 from signals.generator import generate_scalp_signal
 from signals.calculator import calculate_position
@@ -515,6 +516,30 @@ def fmt_diagnostic(trader: LiveTrader, scan_bars: int = 120) -> str:
         L.append("")
     else:
         L += ["*WS-потоки:* `порожньо` — жоден потік ще не стартував ❗", ""]
+
+    # ── ВИКОНАННЯ: де вмирають сигнали (лічильники з моменту старту) ──
+    # Саме ця секція відповідає на «сетапи є, а угод нема — що міша?»
+    paused_ev = getattr(trader, "_paused", None)
+    is_paused = paused_ev is not None and not paused_ev.is_set()
+    L.append(
+        f"*Виконання:* пауза: {'⏸ ТАК ← УВІМКНИ ▶️!' if is_paused else 'ні'} | "
+        f"фільтр стіни: `{'ON' if USE_ORDER_BOOK_WALL_FILTER else 'off'}` | "
+        f"OB-напрям: `{'ON' if USE_ORDER_BOOK_CONFIRMATION else 'off'}`"
+    )
+    es = getattr(trader.state, "exec_stats", None)
+    if es:
+        L.append(
+            f"  сигналів `{es.get('signals', 0)}` → зарізано: "
+            f"стіна `{es.get('wall_blocked', 0)}` · OB-напрям `{es.get('obdir_blocked', 0)}` · "
+            f"калькулятор `{es.get('calc_rejected', 0)}`"
+        )
+        L.append(
+            f"  надіслано на біржу `{es.get('sent', 0)}` → відхилено `{es.get('exchange_rejected', 0)}` "
+            f"→ *відкрито `{es.get('opened', 0)}`*"
+        )
+        if es.get("last_reject"):
+            L.append(f"  ⚠ остання відмова біржі: `{str(es['last_reject'])[:90]}`")
+    L.append("")
 
     mr = cfg.get("meanrev", {})
     if mr.get("enabled"):

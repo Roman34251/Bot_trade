@@ -160,6 +160,20 @@ class LiveState:
     # була видна одразу, без походу в логи сервера.
     ws_status:    dict = field(default_factory=dict)
 
+    # Лічильники ВИКОНАННЯ: де саме «вмирають» сигнали на шляху
+    # стратегія → фільтри → калькулятор → біржа. Показуються у /diag,
+    # щоб причина «сетапи є, угод нема» була видна одразу.
+    exec_stats:   dict = field(default_factory=lambda: {
+        "signals": 0,            # сигналів дійшло від стратегій
+        "wall_blocked": 0,       # зарізав фільтр стіни OB
+        "obdir_blocked": 0,      # зарізав фільтр напрямку OB
+        "calc_rejected": 0,      # зарізав калькулятор (net RR / розмір)
+        "sent": 0,               # ордерів надіслано на біржу
+        "exchange_rejected": 0,  # біржа відхилила
+        "opened": 0,             # позицій реально відкрито
+        "last_reject": None,     # текст останньої відмови біржі
+    })
+
 
 # ── Головний клас ─────────────────────────────────────────────
 
@@ -723,6 +737,8 @@ class LiveTrader:
         if signal is None:
             return None
 
+        self.state.exec_stats["signals"] += 1
+
                 # ── Order Book confirmation / logging ───────────────
         #
         # Нова логіка:
@@ -758,11 +774,13 @@ class LiveTrader:
 
         # Hard-filter тільки для великої стіни проти входу
         if USE_ORDER_BOOK_WALL_FILTER and ob.has_wall_against(direction, signal["entry"]):
+            self.state.exec_stats["wall_blocked"] += 1
             logger.info(f"{symbol}: велика стіна проти {direction.upper()} — skip")
             return None
 
         # Direction-фільтр вмикається тільки якщо явно треба
         if USE_ORDER_BOOK_CONFIRMATION and ob_direction != direction:
+            self.state.exec_stats["obdir_blocked"] += 1
             logger.debug(
                 f"{symbol}: OB hard-filter не підтверджує {direction.upper()} "
                 f"(OB: {ob_direction}) | {ob.summary()}"
@@ -841,10 +859,12 @@ class LiveTrader:
         )
 
         if "error" in pos:
+            self.state.exec_stats["calc_rejected"] += 1
             logger.error(f"Позиція неможлива: {pos['error']}")
             return
 
         if not pos["rr_ok"]:
+            self.state.exec_stats["calc_rejected"] += 1
             logger.warning(
                 f"R:R {pos['rr_ratio']} < floor {pos.get('rr_floor', MIN_RISK_REWARD)} "
                 f"[{signal.get('strategy', signal.get('mode', '?'))}] — skip"
@@ -870,6 +890,7 @@ class LiveTrader:
         tp_side = "sell" if direction == "long" else "buy"
         order = None
         tpsl_attached = False
+        self.state.exec_stats["sent"] += 1
 
         try:
             order = self.rest.create_order(
@@ -898,6 +919,8 @@ class LiveTrader:
                     params = {"positionIdx": 0},
                 )
             except Exception as e:
+                self.state.exec_stats["exchange_rejected"] += 1
+                self.state.exec_stats["last_reject"] = f"{type(e).__name__}: {e}"[:160]
                 logger.error(f"❌ ВХІДНИЙ ордер відхилено біржею: {type(e).__name__}: {e}")
                 # Тротлінг: та сама помилка повторюється кожен цикл (напр.
                 # retCode 10005 permission denied) → 1 алерт на 10 хв, не спам.
@@ -980,6 +1003,7 @@ class LiveTrader:
             self.state.open_trade      = trade_record
             self.state.last_trade_time = datetime.now(timezone.utc)
             self.state.daily_trades   += 1
+            self.state.exec_stats["opened"] += 1
 
             # Push-сповіщення в Telegram (безпечне; нема нотифаєра → no-op)
             await self._notify("notify_trade_opened", trade_record)

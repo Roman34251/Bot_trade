@@ -227,7 +227,7 @@ BYBIT_MAKER_FEE = float(os.getenv("BYBIT_MAKER_FEE", 0.0001))
 
 MARKET_SLIPPAGE = {
     "BTC/USDT:USDT": float(os.getenv("BTC_MARKET_SLIPPAGE", 0.0003)),
-    "SOL/USDT:USDT": float(os.getenv("SOL_MARKET_SLIPPAGE", 0.0005)),
+    #"SOL/USDT:USDT": float(os.getenv("SOL_MARKET_SLIPPAGE", 0.0005)),
 }
 
 BREAKEVEN_PCT = {
@@ -247,7 +247,7 @@ DEPOSIT_USDT          = float(os.getenv("DEPOSIT_USDT",          500))
 RISK_PER_TRADE_PCT    = float(os.getenv("RISK_PER_TRADE_PCT",    0.01))
 RISK_PER_TRADE_USDT   = DEPOSIT_USDT * RISK_PER_TRADE_PCT
 
-MAX_DAILY_LOSS_PCT    = float(os.getenv("MAX_DAILY_LOSS_PCT",    0.03))
+MAX_DAILY_LOSS_PCT    = float(os.getenv("MAX_DAILY_LOSS_PCT",    0.05))
 MAX_DAILY_LOSS_USDT   = DEPOSIT_USDT * MAX_DAILY_LOSS_PCT
 
 # MIN_RISK_REWARD — це NET RR (ПІСЛЯ комісій), який перевіряє виконавець
@@ -325,10 +325,10 @@ ATR_PERIOD_FAST = int(os.getenv("ATR_PERIOD_FAST",  7))
 USE_DUAL_TF_STRATEGY = os.getenv("USE_DUAL_TF_STRATEGY", "false").lower() == "true"
 
 # Order Book робимо не обов'язковим direction-фільтром
-USE_ORDER_BOOK_CONFIRMATION = os.getenv("USE_ORDER_BOOK_CONFIRMATION", "false").lower() == "true"
+USE_ORDER_BOOK_CONFIRMATION = os.getenv("USE_ORDER_BOOK_CONFIRMATION", "false").lower() == "false"
 
 # Але стіну проти входу краще залишити як hard-filter
-USE_ORDER_BOOK_WALL_FILTER = os.getenv("USE_ORDER_BOOK_WALL_FILTER", "true").lower() == "true"
+USE_ORDER_BOOK_WALL_FILTER = os.getenv("USE_ORDER_BOOK_WALL_FILTER", "false").lower() == "false"
 
 
 # ═══════════════════════════════════════════════════════════════
