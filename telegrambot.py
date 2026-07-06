@@ -20,7 +20,7 @@ import asyncio
 import sys
 from datetime import datetime, timezone
 from typing import Any
-
+import os as _os
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest
@@ -61,6 +61,7 @@ except Exception:
 
 _DIAG_SYMBOL = "BTC/USDT:USDT"
 
+_DIAG_BARS = max(12, int(float(_os.getenv("DIAG_HOURS", "4")) * 12))
 # ── Конфіг ────────────────────────────────────────────────
 
 def _load_tg_config() -> tuple[str, int]:
@@ -439,7 +440,7 @@ def _diag_run_all(dfs):
     return res
 
 
-def fmt_diagnostic(trader: LiveTrader, scan_bars: int = 120) -> str:
+def fmt_diagnostic(trader: LiveTrader, scan_bars: int = _DIAG_BARS) -> str:
     """
     Знімок індикаторів проти порогів + короткий реплей історії на ЖИВИХ
     свічках бота. Викликається з Telegram (/diag або кнопка).

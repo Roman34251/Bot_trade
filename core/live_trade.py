@@ -331,6 +331,10 @@ class LiveTrader:
 
         await self._load_initial_candles()
 
+        # Відновлюємо відкриту позицію з біржі (якщо бот перезапустили, поки
+        # угода жива) — інакше бот "забуває" її і може відкрити другу поверх.
+        await self._recover_open_position()
+
         tasks = []
         for symbol in TRADING_PAIRS:
             tasks.append(self._stream_orderbook(symbol))
@@ -354,6 +358,80 @@ class LiveTrader:
                 except Exception as e:
                     logger.error(f"Помилка завантаження {symbol} {tf}: {e}")
         logger.info("✅ Початкові свічки завантажено")
+
+    async def _recover_open_position(self) -> None:
+        """
+        Підтягує ВІДКРИТУ позицію з біржі у state.open_trade після рестарту.
+        Без цього бот "забуває" угоду (state тримається лише в пам'яті) і
+        може відкрити другу поверх неї + не порахує її закриття.
+        TP/SL прикріплені до позиції на біржі — тож захист живий незалежно.
+        """
+        for symbol in TRADING_PAIRS:
+            try:
+                positions = self.rest.fetch_positions([symbol])
+            except Exception as e:
+                logger.warning(f"Recover: fetch_positions {symbol} — {e}")
+                continue
+
+            active = [p for p in positions if float(p.get("contracts", 0) or 0) > 0]
+            if not active:
+                continue
+
+            p = active[0]
+            info = p.get("info", {}) or {}
+
+            side = str(p.get("side") or info.get("side", "")).lower()
+            direction = "long" if side in ("long", "buy") else "short"
+            entry = float(p.get("entryPrice") or info.get("avgPrice") or 0)
+            qty = float(p.get("contracts") or info.get("size") or 0)
+
+            def _num(v):
+                try:
+                    f = float(v)
+                    return f if f > 0 else None
+                except (TypeError, ValueError):
+                    return None
+
+            tp = _num(info.get("takeProfit"))
+            sl = _num(info.get("stopLoss"))
+
+            raw_rr = None
+            if tp and sl and entry and abs(entry - sl) > 0:
+                raw_rr = abs(tp - entry) / abs(entry - sl)
+
+            # Час відкриття з біржі (createdTime, мс) — для коректної тривалості
+            opened_at = datetime.now(timezone.utc)
+            ct = info.get("createdTime")
+            try:
+                if ct:
+                    opened_at = datetime.fromtimestamp(int(ct) / 1000, tz=timezone.utc)
+            except (TypeError, ValueError):
+                pass
+
+            self.state.open_trade = {
+                "symbol":     symbol,
+                "direction":  direction,
+                "entry":      entry,
+                "qty":        qty,
+                "tp":         tp,
+                "sl":         sl,
+                "order_id":   info.get("orderId") or "recovered",
+                "opened_at":  opened_at,
+                "raw_rr":     raw_rr,
+                "strategy":   "recovered",
+                "mode":       "recovered",
+            }
+            logger.info(
+                f"♻️ Відновлено позицію з біржі: {direction.upper()} {qty} {symbol} "
+                f"@ {entry:.2f} | TP={tp} SL={sl}"
+            )
+            await self._notify(
+                "send_alert",
+                f"♻️ *Відновлено відкриту позицію після рестарту*\n"
+                f"{direction.upper()} {qty} `{symbol}` @ {entry:.2f}\n"
+                f"TP `{tp}` SL `{sl}`",
+            )
+            return  # бот тримає рівно 1 позицію
 
 
     @staticmethod
