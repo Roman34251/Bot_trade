@@ -22,16 +22,21 @@ from config.settings import (
     MAX_DAILY_LOSS_PCT,
     MAX_TRADES_PER_DAY,
     MAX_CONSECUTIVE_LOSSES,
+    BYBIT_TAKER_FEE,
+    BYBIT_MAKER_FEE,
+    BTC_SLIPPAGE_PCT,
+    SOL_SLIPPAGE_PCT,
 )
 
 
-# ── Константи ─────────────────────────────────────────────
+# ── Константи (тепер із settings/.env, не хардкоди) ────────
 
-BYBIT_TAKER = Decimal("0.00055")   # 0.055% — маркет завжди taker
+BYBIT_TAKER = Decimal(str(BYBIT_TAKER_FEE))   # вхід і SL — маркет (taker)
+BYBIT_MAKER = Decimal(str(BYBIT_MAKER_FEE))   # TP — лімітний (maker)
 
 SLIPPAGE = {
-    "BTC/USDT:USDT": Decimal("0.0003"),   # 0.03%
-    "SOL/USDT:USDT": Decimal("0.0005"),   # 0.05%
+    "BTC/USDT:USDT": Decimal(str(BTC_SLIPPAGE_PCT)),
+    "SOL/USDT:USDT": Decimal(str(SOL_SLIPPAGE_PCT)),
 }
 
 SYMBOL_CFG = {
@@ -107,21 +112,22 @@ def calculate_position(
 
     pos_value = quantity * entry_price
 
-    # Реальні ціни з slippage (маркет ордер — завжди гірша ціна)
+    # Реальні ціни. Вхід і SL — маркет (сліпедж у гірший бік).
+    # TP — ЛІМІТНИЙ ордер: виконується рівно за своєю ціною, БЕЗ сліпеджу.
     is_long = entry_price < take_profit
 
     if is_long:
         real_entry    = entry_price  * (1 + slip)   # купуємо дорожче
-        real_exit_tp  = take_profit  * (1 - slip)   # продаємо дешевше
+        real_exit_tp  = take_profit                 # ліміт = точна ціна
         real_exit_sl  = stop_loss    * (1 - slip)
     else:
         real_entry    = entry_price  * (1 - slip)   # продаємо дешевше
-        real_exit_tp  = take_profit  * (1 + slip)   # купуємо дорожче
+        real_exit_tp  = take_profit                 # ліміт = точна ціна
         real_exit_sl  = stop_loss    * (1 + slip)
 
-    # Комісії (taker обидва боки)
+    # Комісії: вхід taker, TP maker (ліміт), SL taker
     fee_in     = quantity * real_entry   * BYBIT_TAKER
-    fee_out_tp = quantity * real_exit_tp * BYBIT_TAKER
+    fee_out_tp = quantity * real_exit_tp * BYBIT_MAKER
     fee_out_sl = quantity * real_exit_sl * BYBIT_TAKER
 
     # Gross P&L
@@ -137,8 +143,8 @@ def calculate_position(
 
     rr = net_profit / net_loss if net_loss > 0 else Decimal("0")
 
-    # Мінімальний рух для беззбитку
-    total_cost_pct  = (BYBIT_TAKER + slip) * 2
+    # Мінімальний рух для беззбитку (вхід taker+slip, вихід по TP maker)
+    total_cost_pct  = (BYBIT_TAKER + slip) + BYBIT_MAKER
     breakeven_price = entry_price * total_cost_pct
 
     result = {

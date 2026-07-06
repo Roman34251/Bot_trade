@@ -190,13 +190,20 @@ ACTIVE_API_SECRET = BYBIT_DEMO_SECRET if BYBIT_DEMO else BYBIT_API_SECRET
 
 
 # ═══════════════════════════════════════════════════════════════
-# FEES
+# FEES / SLIPPAGE (використовуються калькулятором позиції!)
 # ═══════════════════════════════════════════════════════════════
 
-# Використовується у fallback-розрахунку PnL (live_trade).
-# Комісії для розрахунку ПОЗИЦІЇ сидять у signals/calculator.py
-# (BYBIT_TAKER + SLIPPAGE) — то окремі константи.
+# Bybit USDT-перпи, стандартний тариф: taker 0.055%, maker 0.02%.
+# Вхід і SL — маркет (taker+сліпедж); TP — ЛІМІТНИЙ (maker, без сліпеджу).
 BYBIT_TAKER_FEE = float(os.getenv("BYBIT_TAKER_FEE", 0.00055))
+BYBIT_MAKER_FEE = float(os.getenv("BYBIT_MAKER_FEE", 0.0002))
+
+# Модель сліпеджу маркет-ордера (частка від ціни, в ОДИН бік).
+# 0.015% — консервативно для BTCUSDT (реально ~0.005-0.01% на 1-2 BTC);
+# стара вшита 0.03% завищувала витрати вдвічі-втричі і різала угоди.
+# Після 10+ угод відкалібруємо за фактичними виконаннями (real_entry).
+BTC_SLIPPAGE_PCT = float(os.getenv("BTC_SLIPPAGE_PCT", 0.00015))
+SOL_SLIPPAGE_PCT = float(os.getenv("SOL_SLIPPAGE_PCT", 0.0003))
 
 
 # ═══════════════════════════════════════════════════════════════

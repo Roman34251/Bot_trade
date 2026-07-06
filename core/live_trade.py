@@ -917,7 +917,12 @@ class LiveTrader:
                     "takeProfit":  float(tp),
                     "stopLoss":    float(sl),
                     "tpslMode":    "Full",
-                    "tpOrderType": "Market",
+                    # TP — ЛІМІТНИЙ (maker 0.02% замість taker 0.055%, без
+                    # сліпеджу). На тісних стопах скальпінгу це найбільший
+                    # важіль економіки. SL лишаємо Market — стоп мусить
+                    # виконатись ГАРАНТОВАНО за будь-яку ціну.
+                    "tpOrderType": "Limit",
+                    "tpLimitPrice": float(tp),
                     "slOrderType": "Market",
                 },
             )
