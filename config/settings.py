@@ -95,7 +95,7 @@ SYMBOL_CONFIG = {
             # .env: MEANREV_USE_ADX=true — вимикати mean-reversion у тренді
             "use_adx_filter": _env_bool("MEANREV_USE_ADX", "false"),
             "adx_max":        float(os.getenv("MEANREV_ADX_MAX", 35)),
-            "min_sl_pct":     0.0018,
+            "min_sl_pct":     float(os.getenv("MIN_SL_PCT", 0.0022)),  # .env: MIN_SL_PCT (мін. стоп 0.22%)
             # .env: MEANREV_MIN_RR (NET після комісій; жорсткіше = більше)
             "min_rr":         float(os.getenv("MEANREV_MIN_RR", 0.5)),
         },
@@ -117,7 +117,7 @@ SYMBOL_CONFIG = {
             "tp_target":      "vwap",
             # .env: VWAP_MIN_DEV_PCT (жорсткіше = більше)
             "min_dev_pct":    float(os.getenv("VWAP_MIN_DEV_PCT", 0.12)),
-            "min_sl_pct":     0.002,
+            "min_sl_pct":     float(os.getenv("MIN_SL_PCT", 0.0022)),  # .env: MIN_SL_PCT
             # .env: VWAP_MIN_RR
             "min_rr":         float(os.getenv("VWAP_MIN_RR", 0.6)),
         },
@@ -148,7 +148,7 @@ SYMBOL_CONFIG = {
             "tp_r":           float(os.getenv("TREND_TP_R", 2.2)),
             "use_rsi_confirm": _env_bool("TREND_USE_RSI", "false"),
             "rsi_period":     14,
-            "min_sl_pct":     0.0018,
+            "min_sl_pct":     float(os.getenv("MIN_SL_PCT", 0.0022)),  # .env: MIN_SL_PCT
             # .env: TREND_MIN_RR (NET після комісій)
             "min_rr":         float(os.getenv("TREND_MIN_RR", 1.4)),
         },
@@ -173,6 +173,15 @@ USE_DUAL_TF_STRATEGY = _env_bool("USE_DUAL_TF_STRATEGY", "false")
 STRATEGY_PRIORITY = os.getenv(
     "STRATEGY_PRIORITY", "trend,vwap,meanrev,sweep"
 ).split(",")
+
+# ── Торгові години (UTC) ─────────────────────────────────────────
+# Поза активними сесіями (азійська ніч) — тонка ліквідність, чоп,
+# фальшиві рухи. TRADE_HOURS_ONLY=true → НОВІ входи лише у вікні
+# [START, END) за UTC. Відкриті позиції моніторяться завжди.
+# 07-21 UTC ≈ Лондон+Нью-Йорк (найбільша ліквідність і напрямок руху).
+TRADE_HOURS_ONLY = _env_bool("TRADE_HOURS_ONLY", "false")
+TRADE_HOUR_START = int(os.getenv("TRADE_HOUR_START",  7))
+TRADE_HOUR_END   = int(os.getenv("TRADE_HOUR_END",   21))
 
 
 # ═══════════════════════════════════════════════════════════════

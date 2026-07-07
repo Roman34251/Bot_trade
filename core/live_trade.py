@@ -49,6 +49,7 @@ from config.settings import (
     USE_SWEEP_STRATEGY, USE_MEANREV_STRATEGY, USE_VWAP_STRATEGY,
     USE_TREND_STRATEGY,
     STRATEGY_PRIORITY,
+    TRADE_HOURS_ONLY, TRADE_HOUR_START, TRADE_HOUR_END,
 )
 from indicators.range_detector import detect_active_range, calculate_atr
 from signals.generator import generate_scalp_signal
@@ -735,6 +736,13 @@ class LiveTrader:
                     if elapsed < MIN_CANDLES_BETWEEN_TRADES:
                         await asyncio.sleep(15)
                         continue
+
+                # Торгові сесії: поза вікном [START,END) UTC нові входи
+                # блокуємо (тонка ліквідність вночі → чоп і фальшиві рухи).
+                # Відкрита позиція вище вже оброблена (моніторинг завжди).
+                if TRADE_HOURS_ONLY and not (TRADE_HOUR_START <= now.hour < TRADE_HOUR_END):
+                    await asyncio.sleep(30)
+                    continue
 
                 # Перевіряємо сигнали
                 for symbol in TRADING_PAIRS:
