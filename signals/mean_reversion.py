@@ -4,22 +4,37 @@
 Незалежна стратегія (НЕ підтвердження для sweep). Працює в боковику.
 
 Ідея (як торгують скальпери-mean-reversion, Connors RSI-2 / BB-fade):
-  - Ціна торкнулась/проколола НИЖНЮ смугу BB + RSI у перепроданості
-        → LONG, ціль = середня смуга BB (середнє, до якого ціна вертається)
-  - Ціна торкнулась/проколола ВЕРХНЮ смугу BB + RSI у перекупленості
-        → SHORT, ціль = середня смуга BB
+  - Ціна проколола НИЖНЮ смугу BB + RSI у перепроданості + свічка ЗАКРИЛАСЬ
+        назад у канал (розворотна) → LONG, ціль = середня смуга BB
+  - Ціна проколола ВЕРХНЮ смугу BB + RSI у перекупленості + свічка ЗАКРИЛАСЬ
+        назад у канал (розворотна) → SHORT, ціль = середня смуга BB
 
-Чому це дає БАГАТО угод:
-  торкання смуг BB на 5m трапляється кілька разів на день у кожен бік,
-  на відміну від sweep-сетапу, який вимагає рідкісного збігу умов.
+════════════════════════════════════════════════════════════════════
+ЩО РЕАЛІЗОВАНО ЗАРАЗ (2026-07-08):
+  1. Смуги Боллінджера (20, 2σ) + RSI-екстремум (пороги з .env).
+  2. Фільтр ширини каналу (вузький канал → TP менший за комісії → skip).
+  3. Опційний ADX-фільтр сили тренду.
+  4. ⭐ ПІДТВЕРДЖЕННЯ РОЗВОРОТУ (reclaim): свічка мусить ЗАКРИТИСЬ назад
+     усередину каналу і бути розворотною (бичача для LONG / ведмежа для
+     SHORT). Це прибирає «ловлю ножів» — вхід, поки ціна ще провалюється.
+  5. ⭐ HTF-ТРЕНДОВИЙ ФІЛЬТР (1h EMA20/EMA50 + нахил): НЕ купуємо проти
+     сильного падіння і НЕ шортимо проти сильного росту. У боковику
+     (тренду нема) — обидва напрямки дозволені.
 
-Економіка (ВАЖЛИВО):
-  mean-reversion свідомо має НИЗЬКИЙ RR (≈0.8-1.0), але високий win-rate.
-  Калькулятор отримує власний min_rr цієї стратегії (settings: meanrev.min_rr),
-  а не загальний поріг sweep. При маркет-ордерах комісія ~0.17% round-trip
-  з'їдає частину прибутку — головний важіль покращення далі: лімітні (maker)
-  входи на смузі або ширший ТФ (15m). Поки що — маркет, щоб збігатись з
-  поточним виконавцем і ПОЧАТИ торгувати/збирати статистику.
+ЧОМУ ЦІ ФІЛЬТРИ (з дослідження):
+  Дослідження BB+RSI mean-reversion одностайне: БЕЗ фільтрів win-rate ≈45%
+  (трендові дні дають катастрофічні серії збитків), З фільтрами (ADX +
+  розворотна свічка + узгодження зі старшим ТФ) — 58-65%. Саме тому в нашій
+  статистиці всі 3 LONG-и на перепроданості в падінні 07-08.07 програли:
+  це були входи проти тренду без підтвердження розвороту.
+
+ЩО ЩЕ МОЖНА ПОКРАЩИТИ (черга апгрейдів):
+  • Лімітні (maker) входи прямо на смузі: −0.035% комісії + без сліпеджу
+    → RR помітно вгору (потребує wait/cancel логіки у виконавці).
+  • Ширший сигнальний ТФ (15m) — менше шуму, чистіші торкання смуг.
+  • Time-stop: закривати угоду, якщо за N свічок ціна не пішла до mid.
+  • RSI-«гачок» (curl-up): вимагати, щоб RSI вже почав розвертатись, а не
+    просто був у зоні (ще один шар підтвердження momentum).
 
 Вхід: MARKET (на закритті сигнальної свічки). Сигнал-дикт сумісний з
 generate_scalp_signal → live_trade._execute_trade працює без змін.
@@ -34,7 +49,7 @@ from loguru import logger
 
 from config.settings import SYMBOL_CONFIG
 from indicators.range_detector import calculate_atr
-from indicators.oscillators import rsi, bollinger_bands, adx
+from indicators.oscillators import rsi, bollinger_bands, adx, ema
 
 
 def _validate(df: Optional[pd.DataFrame], need: int) -> bool:
@@ -44,6 +59,42 @@ def _validate(df: Optional[pd.DataFrame], need: int) -> bool:
         return False
     required = {"open", "high", "low", "close", "volume"}
     return required.issubset(df.columns)
+
+
+def htf_trend_direction(
+    dfs: dict,
+    tf: str = "1h",
+    ema_fast: int = 20,
+    ema_slow: int = 50,
+    slope_lb: int = 5,
+) -> Optional[str]:
+    """
+    Напрямок тренду на старшому ТФ (за останньою свічкою).
+      'up'   — EMA_fast > EMA_slow, ціна > EMA_slow, EMA_slow росте
+      'down' — дзеркально
+      None   — боковик / немає чіткого тренду (контр-тренд дозволено в обидва боки)
+
+    Використовується як «anti-falling-knife» фільтр: не торгувати
+    mean-reversion ПРОТИ сильного тренду старшого ТФ.
+    """
+    df = dfs.get(tf)
+    if df is None or not isinstance(df, pd.DataFrame) or len(df) < ema_slow + slope_lb + 2:
+        return None
+
+    close = df["close"].astype(float)
+    ef = ema(close, ema_fast)
+    es = ema(close, ema_slow)
+
+    f = float(ef.iloc[-1])
+    s = float(es.iloc[-1])
+    s_prev = float(es.iloc[-1 - slope_lb])
+    price = float(close.iloc[-1])
+
+    if f > s and price > s and s > s_prev:
+        return "up"
+    if f < s and price < s and s < s_prev:
+        return "down"
+    return None
 
 
 def generate_meanrev_signal(dfs: dict, symbol: str) -> Optional[dict]:
@@ -74,6 +125,10 @@ def generate_meanrev_signal(dfs: dict, symbol: str) -> Optional[dict]:
     adx_max = float(mr.get("adx_max", 35))
     min_rr = float(mr.get("min_rr", 0.85))
     min_sl_pct = float(mr.get("min_sl_pct", 0.003))
+    # ⭐ нові фільтри якості (2026-07-08)
+    require_reclaim = bool(mr.get("require_reclaim", True))
+    use_trend_filter = bool(mr.get("use_trend_filter", True))
+    trend_filter_tf = str(mr.get("trend_filter_tf", "1h"))
 
     need = max(bb_period, rsi_period) + 5
     if not _validate(df, need):
@@ -128,6 +183,30 @@ def generate_meanrev_signal(dfs: dict, symbol: str) -> Optional[dict]:
 
     if direction is None:
         return None
+
+    o = float(last["open"])
+
+    # ── ⭐ Підтвердження розвороту (reclaim) ─────────────────────
+    # Ключовий анти-«ніж»-фільтр: свічка має ЗАКРИТИСЬ назад у канал
+    # (за смугу вона лише «проколола» тінню) І бути розворотною за
+    # тілом. Без цього ми входимо, поки ціна ще провалюється далі.
+    if require_reclaim:
+        if direction == "long" and not (price > lower and price > o):
+            logger.debug(f"{symbol} [meanrev]: LONG без reclaim у канал — skip (ніж)")
+            return None
+        if direction == "short" and not (price < upper and price < o):
+            logger.debug(f"{symbol} [meanrev]: SHORT без reclaim у канал — skip (ніж)")
+            return None
+
+    # ── ⭐ HTF-трендовий фільтр (не торгувати проти сильного тренду) ─
+    if use_trend_filter:
+        trend = htf_trend_direction(dfs, tf=trend_filter_tf)
+        if direction == "long" and trend == "down":
+            logger.debug(f"{symbol} [meanrev]: LONG проти 1h-падіння — skip")
+            return None
+        if direction == "short" and trend == "up":
+            logger.debug(f"{symbol} [meanrev]: SHORT проти 1h-росту — skip")
+            return None
 
     # ── Рівні TP / SL ────────────────────────────────────────
     # min_sl_pct тут — ВЛАСНИЙ поріг стратегії (НЕ глобальний 0.5%): він

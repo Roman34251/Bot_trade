@@ -95,6 +95,12 @@ SYMBOL_CONFIG = {
             # .env: MEANREV_USE_ADX=true — вимикати mean-reversion у тренді
             "use_adx_filter": _env_bool("MEANREV_USE_ADX", "false"),
             "adx_max":        float(os.getenv("MEANREV_ADX_MAX", 35)),
+            # ⭐ Анти-«ніж» фільтри (2026-07-08). .env-ручки:
+            #   MEANREV_REQUIRE_RECLAIM — свічка має закритись назад у канал
+            #   MEANREV_USE_TREND_FILTER — не торгувати проти 1h-тренду
+            "require_reclaim":   _env_bool("MEANREV_REQUIRE_RECLAIM", "true"),
+            "use_trend_filter":  _env_bool("MEANREV_USE_TREND_FILTER", "true"),
+            "trend_filter_tf":   os.getenv("MEANREV_TREND_TF", "1h"),
             "min_sl_pct":     float(os.getenv("MIN_SL_PCT", 0.0022)),  # .env: MIN_SL_PCT (мін. стоп 0.22%)
             # .env: MEANREV_MIN_RR (NET після комісій; жорсткіше = більше)
             "min_rr":         float(os.getenv("MEANREV_MIN_RR", 0.5)),
@@ -120,6 +126,12 @@ SYMBOL_CONFIG = {
             "min_sl_pct":     float(os.getenv("MIN_SL_PCT", 0.0022)),  # .env: MIN_SL_PCT
             # .env: VWAP_MIN_RR
             "min_rr":         float(os.getenv("VWAP_MIN_RR", 0.6)),
+            # ⭐ Фільтри якості (2026-07-08). .env-ручки:
+            #   VWAP_REQUIRE_REVERSAL — розворотна свічка на екстремумі
+            #   VWAP_USE_TREND_FILTER — не фейдити сильний 1h-тренд
+            "require_reversal_candle": _env_bool("VWAP_REQUIRE_REVERSAL", "true"),
+            "use_trend_filter":        _env_bool("VWAP_USE_TREND_FILTER", "true"),
+            "trend_filter_tf":         os.getenv("VWAP_TREND_TF", "1h"),
         },
 
         # ════════════════════════════════════════════════════════
@@ -252,9 +264,14 @@ COOLDOWN_AFTER_SERIES_MIN  = int(os.getenv("COOLDOWN_AFTER_SERIES_MIN", 45))
 # ORDER BOOK
 # ═══════════════════════════════════════════════════════════════
 
-# Фільтри OB (обидва зараз вимкнені — вмикати на етапі жорсткішання):
+# Фільтри OB (глобальні — діють на ВСІ стратегії; вмикати на жорсткішанні):
 USE_ORDER_BOOK_CONFIRMATION = _env_bool("USE_ORDER_BOOK_CONFIRMATION", "false")
 USE_ORDER_BOOK_WALL_FILTER  = _env_bool("USE_ORDER_BOOK_WALL_FILTER",  "false")
+
+# ⭐ OB-підтвердження АДРЕСНО для sweep (незалежно від глобального прапорця).
+# Sweep без перекосу стакана в бік розвороту — це не sweep, а пробій →
+# пропускаємо. Розблоковано за замовчуванням (запит власника 2026-07-08).
+SWEEP_USE_OB_CONFIRM = _env_bool("SWEEP_USE_OB_CONFIRM", "true")
 
 # Калібрування під BTC (топ-25 рівнів стакана):
 #   imbalance ±12% — шум, ±20% — значущий перекіс

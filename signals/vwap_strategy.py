@@ -17,6 +17,31 @@
 
 Економіка та сама, що й у mean-reversion: низький RR, високий win-rate,
 власний min_rr (settings: vwap.min_rr). Маркет-вхід (поки що).
+
+════════════════════════════════════════════════════════════════════
+ЩО РЕАЛІЗОВАНО ЗАРАЗ (2026-07-08):
+  1. VWAP ± k·σ (ковзне вікно), вхід на відхиленні > k·σ.
+  2. Фільтр мінімальної девіації (замала → ціль ближче за комісії → skip).
+  3. ⭐ ПІДТВЕРДЖЕННЯ РОЗВОРОТНОЮ СВІЧКОЮ: для SHORT остання свічка має
+     бути ведмежою (close<open), для LONG — бичачою. Momentum вже
+     розвертається, а не «ще летить» у бік відхилення.
+  4. ⭐ HTF-ТРЕНДОВИЙ ФІЛЬТР (1h): не шортимо проти сильного росту і не
+     купуємо проти сильного падіння. Це головний фільтр VWAP-reversion:
+     у сильному тренді ціна НЕ вертається до VWAP — VWAP стає динамічною
+     підтримкою/опором, і фейд тренду = стабільний збиток.
+
+ЧОМУ ЦЕ (з дослідження + наша статистика):
+  Головна вимога VWAP-σ-reversion — торгувати ЛИШЕ у боковику; у тренді
+  «exhaustion zone» не спрацьовує. У нашому логі 2 SHORT-и (63826 / 63895)
+  фейдили рух угору до 64211 і програли; спрацював лише SHORT на самій
+  вершині (64211, +1.17%). Трендовий фільтр відсікає перші два.
+
+ЩО ЩЕ МОЖНА ПОКРАЩИТИ:
+  • State-based фільтр: після сигналу не давати новий у той самий бік,
+    поки ціна не повернулась у «нейтральну зону» (±1σ) — прибирає кластери
+    сигналів у тренді.
+  • CVD-дивергенція як додаткове підтвердження абсорбції на екстремумі.
+  • Лімітний (maker) вхід на смузі σ замість маркета.
 """
 
 from __future__ import annotations
@@ -29,6 +54,7 @@ from loguru import logger
 from config.settings import SYMBOL_CONFIG
 from indicators.range_detector import calculate_atr
 from indicators.oscillators import rsi, vwap_bands
+from signals.mean_reversion import htf_trend_direction
 
 
 def _validate(df: Optional[pd.DataFrame], need: int) -> bool:
@@ -65,6 +91,10 @@ def generate_vwap_signal(dfs: dict, symbol: str) -> Optional[dict]:
     min_dev_pct = float(vc.get("min_dev_pct", 0.20))
     min_rr = float(vc.get("min_rr", 0.85))
     min_sl_pct = float(vc.get("min_sl_pct", 0.003))
+    # ⭐ нові фільтри якості (2026-07-08)
+    require_reversal = bool(vc.get("require_reversal_candle", True))
+    use_trend_filter = bool(vc.get("use_trend_filter", True))
+    trend_filter_tf = str(vc.get("trend_filter_tf", "1h"))
 
     need = (window or 30) + 5
     if not _validate(df, need):
@@ -102,6 +132,27 @@ def generate_vwap_signal(dfs: dict, symbol: str) -> Optional[dict]:
 
     if direction is None:
         return None
+
+    # ── ⭐ Підтвердження розворотною свічкою ─────────────────────
+    # Momentum вже має розвертатись у бік VWAP, а не «летіти» далі.
+    if require_reversal:
+        o = float(df["open"].astype(float).iloc[-1])
+        if direction == "long" and not (price > o):
+            logger.debug(f"{symbol} [vwap]: LONG без бичачої свічки — skip")
+            return None
+        if direction == "short" and not (price < o):
+            logger.debug(f"{symbol} [vwap]: SHORT без ведмежої свічки — skip")
+            return None
+
+    # ── ⭐ HTF-трендовий фільтр (не фейдити сильний тренд) ───────
+    if use_trend_filter:
+        trend = htf_trend_direction(dfs, tf=trend_filter_tf)
+        if direction == "long" and trend == "down":
+            logger.debug(f"{symbol} [vwap]: LONG проти 1h-падіння — skip")
+            return None
+        if direction == "short" and trend == "up":
+            logger.debug(f"{symbol} [vwap]: SHORT проти 1h-росту — skip")
+            return None
 
     # ── Рівні TP / SL ────────────────────────────────────────
     # min_sl_pct — власний поріг стратегії (мінімальна дистанція SL для

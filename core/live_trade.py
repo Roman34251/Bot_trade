@@ -45,6 +45,7 @@ from config.settings import (
     USE_DUAL_TF_STRATEGY,
     USE_ORDER_BOOK_CONFIRMATION,
     USE_ORDER_BOOK_WALL_FILTER,
+    SWEEP_USE_OB_CONFIRM,
     SYMBOL_CONFIG,
     USE_SWEEP_STRATEGY, USE_MEANREV_STRATEGY, USE_VWAP_STRATEGY,
     USE_TREND_STRATEGY,
@@ -850,8 +851,24 @@ class LiveTrader:
             ob = self.state.ob_snapshots.get(symbol)
 
         direction = signal["direction"]
+        strat = str(signal.get("strategy", ""))
+
+        # OB як ПІДТВЕРДЖЕННЯ напрямку: вмикається глобально
+        # (USE_ORDER_BOOK_CONFIRMATION) АБО адресно для sweep
+        # (SWEEP_USE_OB_CONFIRM). Для sweep це критичний «підпис»
+        # розвороту: після зняття ліквідності перекіс стакана має бути
+        # в бік входу (абсорбція пасивними заявками).
+        need_ob_confirm = USE_ORDER_BOOK_CONFIRMATION or (
+            strat == "sweep" and SWEEP_USE_OB_CONFIRM
+        )
 
         if ob is None:
+            # Якщо OB — обов'язкове підтвердження, а даних немає → не входимо
+            # (краще пропустити sweep, ніж торгувати наосліп).
+            if need_ob_confirm:
+                self.state.exec_stats["obdir_blocked"] += 1
+                logger.debug(f"{symbol}: {strat} потребує OB-підтвердження, а даних нема — skip")
+                return None
             logger.debug(f"{symbol}: немає order book даних — продовжуємо без OB")
             signal["ob_imbalance"] = None
             signal["ob_bid_total"] = None
@@ -861,6 +878,10 @@ class LiveTrader:
         ob_age = (datetime.now(timezone.utc) - ob.timestamp).total_seconds()
 
         if ob_age > OB_MAX_AGE_SECONDS:
+            if need_ob_confirm:
+                self.state.exec_stats["obdir_blocked"] += 1
+                logger.debug(f"{symbol}: {strat} потребує OB, а він застарів ({ob_age:.1f}с) — skip")
+                return None
             logger.debug(
                 f"{symbol}: order book застарів ({ob_age:.1f}с) — продовжуємо без OB"
             )
@@ -878,12 +899,12 @@ class LiveTrader:
             logger.info(f"{symbol}: велика стіна проти {direction.upper()} — skip")
             return None
 
-        # Direction-фільтр вмикається тільки якщо явно треба
-        if USE_ORDER_BOOK_CONFIRMATION and ob_direction != direction:
+        # Direction-фільтр: глобально або адресно для sweep
+        if need_ob_confirm and ob_direction != direction:
             self.state.exec_stats["obdir_blocked"] += 1
             logger.debug(
-                f"{symbol}: OB hard-filter не підтверджує {direction.upper()} "
-                f"(OB: {ob_direction}) | {ob.summary()}"
+                f"{symbol}: OB не підтверджує {direction.upper()} "
+                f"(OB: {ob_direction}, strat={strat}) | {ob.summary()}"
             )
             return None
 
