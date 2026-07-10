@@ -54,7 +54,7 @@ from config.settings import (
     TRADE_HOURS_ONLY, TRADE_HOUR_START, TRADE_HOUR_END,
 )
 from indicators.range_detector import detect_active_range, calculate_atr
-from indicators.structure import first_trouble_area
+from structure import first_trouble_area
 from signals.generator import generate_scalp_signal
 from signals.mean_reversion import generate_meanrev_signal
 from signals.vwap_strategy import generate_vwap_signal
