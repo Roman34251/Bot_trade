@@ -46,6 +46,7 @@ from config.settings import (
     USE_ORDER_BOOK_CONFIRMATION,
     USE_ORDER_BOOK_WALL_FILTER,
     SWEEP_USE_OB_CONFIRM,
+    USE_FTA_FILTER, FTA_TF, FTA_SWING_LOOKBACK, FTA_BUFFER_PCT,
     SYMBOL_CONFIG,
     USE_SWEEP_STRATEGY, USE_MEANREV_STRATEGY, USE_VWAP_STRATEGY,
     USE_TREND_STRATEGY,
@@ -53,6 +54,7 @@ from config.settings import (
     TRADE_HOURS_ONLY, TRADE_HOUR_START, TRADE_HOUR_END,
 )
 from indicators.range_detector import detect_active_range, calculate_atr
+from indicators.structure import first_trouble_area
 from signals.generator import generate_scalp_signal
 from signals.mean_reversion import generate_meanrev_signal
 from signals.vwap_strategy import generate_vwap_signal
@@ -174,6 +176,7 @@ class LiveState:
         "sent": 0,               # ордерів надіслано на біржу
         "exchange_rejected": 0,  # біржа відхилила
         "opened": 0,             # позицій реально відкрито
+        "fta_blocked": 0,        # зарізав FTA-фільтр (TP за проблемною зоною HTF)
         "last_reject": None,     # текст останньої відмови біржі
     })
 
@@ -840,6 +843,22 @@ class LiveTrader:
 
         self.state.exec_stats["signals"] += 1
 
+        # ── FTA: проблемна зона старшого ТФ між входом і TP ──────
+        # Бот «бачить» найближчу зустрічну зону HTF. За USE_FTA_FILTER=false
+        # лише позначає (для сповіщення/логів); =true — ріже такі угоди.
+        self._annotate_fta(signal, dfs.get(FTA_TF))
+        if USE_FTA_FILTER and signal.get("fta_blocks_tp"):
+            self.state.exec_stats["fta_blocked"] = (
+                self.state.exec_stats.get("fta_blocked", 0) + 1
+            )
+            _fp = signal.get("fta_price") or 0.0
+            _fd = signal.get("fta_dist_pct") or 0.0
+            logger.info(
+                f"{symbol}: TP за проблемною зоною HTF "
+                f"(FTA={_fp:.2f} dist={_fd:.2f}%) — skip"
+            )
+            return None
+
                 # ── Order Book confirmation / logging ───────────────
         #
         # Нова логіка:
@@ -921,6 +940,38 @@ class LiveTrader:
         )
 
         return signal
+
+    def _annotate_fta(self, signal: dict, df_htf) -> None:
+        """
+        Рахує FTA (найближчу проблемну зону HTF між входом і TP) і кладе в
+        сигнал поля: fta_price / fta_blocks_tp / fta_dist_pct. Ніколи не
+        ламає торгівлю — при будь-якій помилці просто лишає None.
+        """
+        signal["fta_price"] = None
+        signal["fta_blocks_tp"] = False
+        signal["fta_dist_pct"] = None
+        try:
+            res = first_trouble_area(
+                df_htf,
+                direction=signal["direction"],
+                entry=float(signal["entry"]),
+                tp=float(signal["tp"]),
+                lookback=FTA_SWING_LOOKBACK,
+                buffer_pct=FTA_BUFFER_PCT,
+            )
+        except Exception as e:
+            logger.debug(f"FTA calc failed: {e}")
+            return
+        if not res:
+            return
+        signal["fta_price"] = res["fta"]
+        signal["fta_blocks_tp"] = res["blocks_tp"]
+        signal["fta_dist_pct"] = res["dist_pct"]
+        if res["blocks_tp"]:
+            logger.info(
+                f"{signal['symbol']}: ⚠️ FTA {signal['direction'].upper()} "
+                f"зона={res['fta']:.2f} ({res['dist_pct']:.2f}%) МІЖ входом і TP"
+            )
 
     def _get_ob_signal(self, symbol: str) -> Optional[str]:
         """
@@ -1124,6 +1175,10 @@ class LiveTrader:
                 "bb_percent_b": signal.get("bb_percent_b"),
                 "bb_width_pct": signal.get("bb_width_pct"),
                 "vwap_dev_pct": signal.get("vwap_dev_pct"),
+                # FTA — проблемна зона старшого ТФ
+                "fta_price":     signal.get("fta_price"),
+                "fta_blocks_tp": signal.get("fta_blocks_tp", False),
+                "fta_dist_pct":  signal.get("fta_dist_pct"),
             }
 
             self.state.open_trade      = trade_record

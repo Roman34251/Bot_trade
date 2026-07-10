@@ -228,21 +228,31 @@ def fmt_filters(t: dict) -> list[str]:
     """
     strat = (t.get("strategy") or t.get("mode") or "").lower()
     if strat == "meanrev":
-        return [
+        lines = [
             f"  RSI: `{fmt_num(t.get('rsi'), 1)}`",
             f"  BB %b: `{fmt_num(t.get('bb_percent_b'), 2)}` | ширина: `{fmt_num(t.get('bb_width_pct'), 2)}%`",
         ]
-    if strat == "vwap":
-        return [
+    elif strat == "vwap":
+        lines = [
             f"  VWAP дев.: `{fmt_num(t.get('vwap_dev_pct'), 2, signed=True)}%`",
             f"  RSI: `{fmt_num(t.get('rsi'), 1)}`",
         ]
-    return [
-        f"  OF delta: `{fmt_num(t.get('of_delta'), 0, signed=True)}`",
-        f"  CVD: `{t.get('cvd_signal', 'n/a')}` | ok: {fmt_bool(t.get('cvd_ok'))}",
-        f"  Volume ok: {fmt_bool(t.get('volume_ok'))}",
-        f"  OB: `{fmt_ob(t.get('ob_imbalance'))}` | confirmed: {fmt_bool(t.get('ob_confirmed'))}",
-    ]
+    else:
+        lines = [
+            f"  OF delta: `{fmt_num(t.get('of_delta'), 0, signed=True)}`",
+            f"  CVD: `{t.get('cvd_signal', 'n/a')}` | ok: {fmt_bool(t.get('cvd_ok'))}",
+            f"  Volume ok: {fmt_bool(t.get('volume_ok'))}",
+            f"  OB: `{fmt_ob(t.get('ob_imbalance'))}` | confirmed: {fmt_bool(t.get('ob_confirmed'))}",
+        ]
+
+    # FTA — проблемна зона старшого ТФ (показуємо, лише якщо порахована)
+    fta = t.get("fta_price")
+    if fta is not None:
+        flag = "⚠️ TP за зоною" if t.get("fta_blocks_tp") else "✅ вільно до TP"
+        lines.append(
+            f"  FTA(HTF): `{fmt_num(fta, 1)}` ({fmt_num(t.get('fta_dist_pct'), 2)}%) — {flag}"
+        )
+    return lines
 
 
 def fmt_trader_state(trader: LiveTrader) -> str:
@@ -817,18 +827,42 @@ class TradingBot:
     # ── Авто-сповіщення ───────────────────────────────────
 
     async def send_alert(self, text: str) -> None:
-        """Відправляє сповіщення адміну."""
+        """
+        Відправляє сповіщення адміну. Стійке до:
+          • спецсимволів Markdown → фолбек на plain text;
+          • тимчасових мережевих збоїв Telegram → до 3 спроб із паузою.
+        Помилку логуємо ГУЧНО (з admin_id), щоб «сповіщення не приходять»
+        було видно в journalctl, а не гасилось тихо.
+        """
         if self.admin_id == 0:
+            logger.warning("send_alert: TELEGRAM_ADMIN_ID=0 — нема кому слати алерт!")
             return
 
-        try:
-            await self.bot.send_message(self.admin_id, text, parse_mode="Markdown")
-        except TelegramBadRequest as e:
-            # Якщо Markdown зламався через спецсимволи — шлемо plain text.
-            logger.warning(f"Telegram Markdown помилка, надсилаю plain text: {e}")
-            await self.bot.send_message(self.admin_id, text, parse_mode=None)
-        except Exception as e:
-            logger.error(f"Помилка відправки алерту: {e}")
+        for attempt in range(1, 4):
+            try:
+                await self.bot.send_message(self.admin_id, text, parse_mode="Markdown")
+                return
+            except TelegramBadRequest as e:
+                # Markdown зламався через спецсимволи — шлемо plain text.
+                logger.warning(f"Telegram Markdown помилка, plain text: {e}")
+                try:
+                    await self.bot.send_message(self.admin_id, text, parse_mode=None)
+                    return
+                except Exception as e2:
+                    logger.error(f"send_alert plain-text теж впав: {e2}")
+                    return
+            except Exception as e:
+                logger.error(
+                    f"send_alert спроба {attempt}/3 до admin_id={self.admin_id} "
+                    f"впала: {type(e).__name__}: {e}"
+                )
+                if attempt < 3:
+                    await asyncio.sleep(2 * attempt)
+
+        logger.critical(
+            f"🆘 send_alert: НЕ вдалось доставити алерт адміну {self.admin_id} "
+            f"після 3 спроб — перевір токен/мережу/чи натиснув /start у бота"
+        )
 
     async def notify_trade_opened(self, signal: dict) -> None:
         direction_emoji = "🟢" if signal["direction"] == "long" else "🔴"

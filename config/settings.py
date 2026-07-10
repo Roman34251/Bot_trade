@@ -273,6 +273,20 @@ USE_ORDER_BOOK_WALL_FILTER  = _env_bool("USE_ORDER_BOOK_WALL_FILTER",  "false")
 # пропускаємо. Розблоковано за замовчуванням (запит власника 2026-07-08).
 SWEEP_USE_OB_CONFIRM = _env_bool("SWEEP_USE_OB_CONFIRM", "true")
 
+
+# ═══════════════════════════════════════════════════════════════
+# FTA — First Trouble Area (проблемні зони на старшому ТФ)
+# ═══════════════════════════════════════════════════════════════
+# Бот дивиться, чи між входом і TP стоїть найближча зустрічна зона HTF
+# (свінг-хай для лонга / свінг-лоу для шорта). Якщо TP «за перешкодою» —
+# угода нижчої якості.
+#   USE_FTA_FILTER=false → лише ПОКАЗУЄ зону в сповіщенні/логах (не ріже).
+#   USE_FTA_FILTER=true  → пропускає угоди, де TP за проблемною зоною.
+USE_FTA_FILTER       = _env_bool("USE_FTA_FILTER", "false")
+FTA_TF               = os.getenv("FTA_TF", "1h")
+FTA_SWING_LOOKBACK   = int(os.getenv("FTA_SWING_LOOKBACK", 3))
+FTA_BUFFER_PCT       = float(os.getenv("FTA_BUFFER_PCT", 0.0005))
+
 # Калібрування під BTC (топ-25 рівнів стакана):
 #   imbalance ±12% — шум, ±20% — значущий перекіс
 #   стіна 3× середнього — постійне явище (різало все); 8× — реальна стіна
