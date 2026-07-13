@@ -9,7 +9,7 @@
 1) Знаходимо активний 1h range
 2) Чекаємо sweep нижньої/верхньої межі range (у вікні sweep_window)
 3) Чекаємо reclaim всередину range (на останній свічці)
-4) Scored-підтвердження: BOS / order-flow / momentum (≥ min_confirmations)
+4) Щонайменше два незалежні підтвердження: BOS / order-flow / momentum
 5) CVD / volume — лог (опційно hard-filter)
 6) Рахуємо SL/TP і перевіряємо RR
 7) ⭐ Order Book як ПІДТВЕРДЖЕННЯ напрямку — застосовується у live_trade
@@ -18,7 +18,8 @@
 ════════════════════════════════════════════════════════════════════
 ЩО РЕАЛІЗОВАНО ЗАРАЗ (2026-07-08):
   • Детекція рейнджу за ATR + sweep за межу + reclaim.
-  • Scored-підтвердження (BOS/OF/MOM) замість жорсткого ланцюга.
+  • Щонайменше 2 незалежні підтвердження (BOS/OF/MOM); BOS і MOM однієї
+    свічки не рахуються двічі.
   • ⭐ Order Book confirmation РОЗБЛОКОВАНО саме для sweep: угода
     проходить, лише якщо дисбаланс стакана підтверджує розворот
     (bid-перекіс для LONG / ask-перекіс для SHORT). Це головний
@@ -441,7 +442,8 @@ def generate_scalp_signal(
     # підтверджень. Раніше потрібен був збіг sweep+BOS+order-flow на ОДНІЙ
     # свічці → майже ніколи → 0 угод.
     sweep_window = int(symbol_cfg.get("sweep_window", 12))
-    min_confirmations = int(symbol_cfg.get("min_confirmations", 1))
+    # Два незалежні класи підтвердження — незнижуваний quality floor.
+    min_confirmations = max(2, int(symbol_cfg.get("min_confirmations", 2)))
 
     # Range-параметри — раніше не передавались у _detect_active_range,
     # тому хардкод-дефолти (1.5 / 8.0 / 2.5) ігнорували SYMBOL_CONFIG.
@@ -531,7 +533,9 @@ def generate_scalp_signal(
         confirmations.append("BOS")
     if of_ok:
         confirmations.append("OF")
-    if momentum_ok:
+    # BOS уже включає directional candle, тому MOM у такому разі є тим самим
+    # price-action фактом, а не другим незалежним підтвердженням.
+    if momentum_ok and not bos_ok:
         confirmations.append("MOM")
 
     # Якщо order-flow явно вмикають як обов'язковий — лишаємо hard-filter

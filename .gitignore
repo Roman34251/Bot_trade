@@ -1,4 +1,11 @@
 .env
+.env.local
+.env.production
+.env.demo
+ssh-key-*
+id_rsa*
+id_ed25519*
+*.pem
 CLAUDE.md
 __pycache__
 *.pyc

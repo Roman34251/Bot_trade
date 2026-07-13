@@ -92,13 +92,14 @@ def cmd_status() -> None:
 
 def cmd_demo() -> None:
     """Запускає бота на demo рахунку Bybit."""
-    from config.settings import BYBIT_DEMO, BYBIT_DEMO_KEY
+    if not BYBIT_DEMO:
+        logger.error(
+            "❌ Відмовлено: --demo, але BYBIT_DEMO=false. "
+            "Зміни .env на BYBIT_DEMO=true."
+        )
+        return
 
-    print(f"BYBIT_DEMO={BYBIT_DEMO}")
-    print(f"BYBIT_DEMO_KEY='{BYBIT_DEMO_KEY}' (len={len(BYBIT_DEMO_KEY)})")
-    print(f"ACTIVE_API_KEY='{ACTIVE_API_KEY}' (len={len(ACTIVE_API_KEY)})")
-
-    if not ACTIVE_API_KEY:
+    if not ACTIVE_API_KEY or not ACTIVE_API_SECRET:
         logger.error("❌ API ключі не встановлені!")
         logger.error("   Заповни BYBIT_DEMO_KEY і BYBIT_DEMO_SECRET в .env")
         return
@@ -116,7 +117,7 @@ def cmd_live() -> None:
         logger.error("❌ BYBIT_DEMO=true в .env — встанови false для live торгівлі")
         return
 
-    if not ACTIVE_API_KEY:
+    if not ACTIVE_API_KEY or not ACTIVE_API_SECRET:
         logger.error("❌ API ключі не встановлені!")
         return
 

@@ -24,7 +24,14 @@ load_dotenv()
 
 
 def _env_bool(name: str, default: str = "false") -> bool:
-    return os.getenv(name, default).lower() == "true"
+    raw = os.getenv(name, default).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{name} має бути true/false (або 1/0, yes/no, on/off), отримано {raw!r}"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -54,7 +61,8 @@ SYMBOL_CONFIG = {
 
         # Sweep як setup-state (вікно) + scored-підтвердження
         "sweep_window":        12,
-        "min_confirmations":   1,
+        # Щонайменше два незалежні голоси; MOM сам по собі sweep не підтверджує.
+        "min_confirmations":   int(os.getenv("SWEEP_MIN_CONFIRMATIONS", 2)),
 
         # Order Flow — м'яке підтвердження (не hard-filter)
         "order_flow_lookback": 3,
@@ -85,16 +93,19 @@ SYMBOL_CONFIG = {
             "bb_std":         2.0,
             "rsi_period":     14,
             # .env: MEANREV_RSI_OS / MEANREV_RSI_OB (жорсткіше = 30/70)
-            "rsi_oversold":   float(os.getenv("MEANREV_RSI_OS", 35)),
-            "rsi_overbought": float(os.getenv("MEANREV_RSI_OB", 65)),
+            "rsi_oversold":   float(os.getenv("MEANREV_RSI_OS", 32)),
+            "rsi_overbought": float(os.getenv("MEANREV_RSI_OB", 68)),
             "require_rsi":    True,
             "tp_target":      "mid",
             "sl_atr_buffer":  0.5,
             # .env: MEANREV_MIN_WIDTH_PCT (жорсткіше = більше)
-            "min_width_pct":  float(os.getenv("MEANREV_MIN_WIDTH_PCT", 0.18)),
+            "min_width_pct":  float(os.getenv("MEANREV_MIN_WIDTH_PCT", 0.25)),
             # .env: MEANREV_USE_ADX=true — вимикати mean-reversion у тренді
-            "use_adx_filter": _env_bool("MEANREV_USE_ADX", "false"),
+            "use_adx_filter": _env_bool("MEANREV_USE_ADX", "true"),
             "adx_max":        float(os.getenv("MEANREV_ADX_MAX", 35)),
+            # RSI має вже розвертатися з екстремуму, а не лише бути нижче/вище порогу.
+            "require_rsi_hook": _env_bool("MEANREV_REQUIRE_RSI_HOOK", "true"),
+            "rsi_hook_delta":   float(os.getenv("MEANREV_RSI_HOOK_DELTA", 0.5)),
             # ⭐ Анти-«ніж» фільтри (2026-07-08). .env-ручки:
             #   MEANREV_REQUIRE_RECLAIM — свічка має закритись назад у канал
             #   MEANREV_USE_TREND_FILTER — не торгувати проти 1h-тренду
@@ -103,7 +114,7 @@ SYMBOL_CONFIG = {
             "trend_filter_tf":   os.getenv("MEANREV_TREND_TF", "1h"),
             "min_sl_pct":     float(os.getenv("MIN_SL_PCT", 0.0022)),  # .env: MIN_SL_PCT (мін. стоп 0.22%)
             # .env: MEANREV_MIN_RR (NET після комісій; жорсткіше = більше)
-            "min_rr":         float(os.getenv("MEANREV_MIN_RR", 0.5)),
+            "min_rr":         float(os.getenv("MEANREV_MIN_RR", 0.7)),
         },
 
         # ════════════════════════════════════════════════════════
@@ -112,9 +123,10 @@ SYMBOL_CONFIG = {
         "vwap": {
             "enabled":        _env_bool("VWAP_ENABLED", "true"),
             "tf":             "5m",
+            "mode":           os.getenv("VWAP_MODE", "session").strip().lower(),
             "window":         int(os.getenv("VWAP_WINDOW", 96)),
             # .env: VWAP_K_BAND (жорсткіше = більше, класика 2.0)
-            "k_band":         float(os.getenv("VWAP_K_BAND", 1.8)),
+            "k_band":         float(os.getenv("VWAP_K_BAND", 2.0)),
             "require_rsi":    False,
             "rsi_period":     14,
             "rsi_oversold":   42,
@@ -122,16 +134,19 @@ SYMBOL_CONFIG = {
             "sl_k":           3.5,
             "tp_target":      "vwap",
             # .env: VWAP_MIN_DEV_PCT (жорсткіше = більше)
-            "min_dev_pct":    float(os.getenv("VWAP_MIN_DEV_PCT", 0.12)),
+            "min_dev_pct":    float(os.getenv("VWAP_MIN_DEV_PCT", 0.20)),
             "min_sl_pct":     float(os.getenv("MIN_SL_PCT", 0.0022)),  # .env: MIN_SL_PCT
             # .env: VWAP_MIN_RR
-            "min_rr":         float(os.getenv("VWAP_MIN_RR", 0.6)),
+            "min_rr":         float(os.getenv("VWAP_MIN_RR", 0.7)),
             # ⭐ Фільтри якості (2026-07-08). .env-ручки:
             #   VWAP_REQUIRE_REVERSAL — розворотна свічка на екстремумі
             #   VWAP_USE_TREND_FILTER — не фейдити сильний 1h-тренд
             "require_reversal_candle": _env_bool("VWAP_REQUIRE_REVERSAL", "true"),
             "use_trend_filter":        _env_bool("VWAP_USE_TREND_FILTER", "true"),
             "trend_filter_tf":         os.getenv("VWAP_TREND_TF", "1h"),
+            # VWAP-reversion дозволена лише поза сильним локальним трендом.
+            "use_adx_filter":          _env_bool("VWAP_USE_ADX", "true"),
+            "adx_max":                 float(os.getenv("VWAP_ADX_MAX", 28)),
         },
 
         # ════════════════════════════════════════════════════════
@@ -149,7 +164,10 @@ SYMBOL_CONFIG = {
             "ema_slope_lookback": 5,
             "adx_period":     14,
             # .env: TREND_ADX_MIN (жорсткіше = більше; 18 м'яко, 22 суворо)
-            "adx_min":        float(os.getenv("TREND_ADX_MIN", 18)),
+            "adx_min":        float(os.getenv("TREND_ADX_MIN", 22)),
+            "require_adx_rising": _env_bool("TREND_REQUIRE_ADX_RISING", "true"),
+            "adx_rise_lookback": int(os.getenv("TREND_ADX_RISE_LOOKBACK", 2)),
+            "adx_rise_min": float(os.getenv("TREND_ADX_RISE_MIN", 0.0)),
             "atr_period":     14,
             "pullback_lookback": 6,
             "max_pullback_below_ema_atr": 0.5,
@@ -159,6 +177,7 @@ SYMBOL_CONFIG = {
             # .env: TREND_TP_R (ціль у R; gross)
             "tp_r":           float(os.getenv("TREND_TP_R", 2.2)),
             "use_rsi_confirm": _env_bool("TREND_USE_RSI", "false"),
+            "require_intact_pullback": _env_bool("TREND_REQUIRE_INTACT_PULLBACK", "true"),
             "rsi_period":     14,
             "min_sl_pct":     float(os.getenv("MIN_SL_PCT", 0.0022)),  # .env: MIN_SL_PCT
             # .env: TREND_MIN_RR (NET після комісій)
@@ -191,7 +210,7 @@ STRATEGY_PRIORITY = os.getenv(
 # фальшиві рухи. TRADE_HOURS_ONLY=true → НОВІ входи лише у вікні
 # [START, END) за UTC. Відкриті позиції моніторяться завжди.
 # 07-21 UTC ≈ Лондон+Нью-Йорк (найбільша ліквідність і напрямок руху).
-TRADE_HOURS_ONLY = _env_bool("TRADE_HOURS_ONLY", "false")
+TRADE_HOURS_ONLY = _env_bool("TRADE_HOURS_ONLY", "true")
 TRADE_HOUR_START = int(os.getenv("TRADE_HOUR_START",  7))
 TRADE_HOUR_END   = int(os.getenv("TRADE_HOUR_END",   21))
 
@@ -204,7 +223,8 @@ BYBIT_API_KEY    = os.getenv("BYBIT_API_KEY",    "")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
 BYBIT_DEMO_KEY   = os.getenv("BYBIT_DEMO_KEY",   "")
 BYBIT_DEMO_SECRET = os.getenv("BYBIT_DEMO_SECRET", "")
-BYBIT_DEMO       = _env_bool("BYBIT_DEMO", "false")
+# Fail-safe default: live mode має бути лише явним BYBIT_DEMO=false.
+BYBIT_DEMO       = _env_bool("BYBIT_DEMO", "true")
 
 ACTIVE_API_KEY    = BYBIT_DEMO_KEY    if BYBIT_DEMO else BYBIT_API_KEY
 ACTIVE_API_SECRET = BYBIT_DEMO_SECRET if BYBIT_DEMO else BYBIT_API_SECRET
@@ -215,7 +235,8 @@ ACTIVE_API_SECRET = BYBIT_DEMO_SECRET if BYBIT_DEMO else BYBIT_API_SECRET
 # ═══════════════════════════════════════════════════════════════
 
 # Bybit USDT-перпи, стандартний тариф: taker 0.055%, maker 0.02%.
-# Вхід і SL — маркет (taker+сліпедж); TP — ЛІМІТНИЙ (maker, без сліпеджу).
+# Вхід і SL — market. TP — triggered limit без slippage, але калькулятор
+# fail-safe оцінює його fee як taker: maker-статус не гарантований.
 BYBIT_TAKER_FEE = float(os.getenv("BYBIT_TAKER_FEE", 0.00055))
 BYBIT_MAKER_FEE = float(os.getenv("BYBIT_MAKER_FEE", 0.0002))
 
@@ -236,6 +257,12 @@ SOL_SLIPPAGE_PCT = float(os.getenv("SOL_SLIPPAGE_PCT", 0.0003))
 USE_REAL_BALANCE      = _env_bool("USE_REAL_BALANCE", "true")
 DEPOSIT_USDT          = float(os.getenv("DEPOSIT_USDT",          500))
 RISK_PER_TRADE_PCT    = float(os.getenv("RISK_PER_TRADE_PCT",    0.01))
+
+# Жорсткий cap позиції: навіть при дуже тісному SL notional не може перевищити
+# equity × MAX_NOTIONAL_EQUITY_MULT. BYBIT_LEVERAGE реально виставляється на біржі.
+# 0 = не змінювати плече на біржі / не ставити штучний cap номіналу.
+BYBIT_LEVERAGE              = int(os.getenv("BYBIT_LEVERAGE", 0))
+MAX_NOTIONAL_EQUITY_MULT    = float(os.getenv("MAX_NOTIONAL_EQUITY_MULT", 0.0))
 
 MAX_DAILY_LOSS_PCT    = float(os.getenv("MAX_DAILY_LOSS_PCT",    0.03))
 
@@ -259,6 +286,17 @@ MAX_CONSECUTIVE_LOSSES     = int(os.getenv("MAX_CONSECUTIVE_LOSSES",     4))
 # streak не скидається)
 COOLDOWN_AFTER_SERIES_MIN  = int(os.getenv("COOLDOWN_AFTER_SERIES_MIN", 45))
 
+# Сигнали рахуються лише на закритих свічках; одна спроба на setup/bar.
+SIGNALS_USE_CLOSED_CANDLES = _env_bool("SIGNALS_USE_CLOSED_CANDLES", "true")
+SIGNAL_DEDUP_ENABLED       = _env_bool("SIGNAL_DEDUP_ENABLED", "true")
+MAX_ENTRY_DRIFT_BPS        = float(os.getenv("MAX_ENTRY_DRIFT_BPS", 12.0))
+
+# Optional maker-entry. Код підтримує PostOnly + TTL + market fallback, але прапорець
+# слід вмикати лише після demo-forward перевірки fill-rate/adverse selection.
+USE_MAKER_ENTRY          = _env_bool("USE_MAKER_ENTRY", "false")
+MAKER_ENTRY_TTL_SEC      = float(os.getenv("MAKER_ENTRY_TTL_SEC", 4.0))
+MAKER_FALLBACK_TO_MARKET = _env_bool("MAKER_FALLBACK_TO_MARKET", "true")
+
 
 # ═══════════════════════════════════════════════════════════════
 # ORDER BOOK
@@ -266,7 +304,7 @@ COOLDOWN_AFTER_SERIES_MIN  = int(os.getenv("COOLDOWN_AFTER_SERIES_MIN", 45))
 
 # Фільтри OB (глобальні — діють на ВСІ стратегії; вмикати на жорсткішанні):
 USE_ORDER_BOOK_CONFIRMATION = _env_bool("USE_ORDER_BOOK_CONFIRMATION", "false")
-USE_ORDER_BOOK_WALL_FILTER  = _env_bool("USE_ORDER_BOOK_WALL_FILTER",  "false")
+USE_ORDER_BOOK_WALL_FILTER  = _env_bool("USE_ORDER_BOOK_WALL_FILTER",  "true")
 
 # ⭐ OB-підтвердження АДРЕСНО для sweep (незалежно від глобального прапорця).
 # Sweep без перекосу стакана в бік розвороту — це не sweep, а пробій →
@@ -297,6 +335,16 @@ OB_MAX_AGE_SECONDS     = int(os.getenv("OB_MAX_AGE_SECONDS",         10))
 OB_WALL_THRESHOLD_MULT = float(os.getenv("OB_WALL_THRESHOLD_MULT",    8.0))
 OB_WALL_BLOCK_PCT      = float(os.getenv("OB_WALL_BLOCK_PCT",        0.0005))
 
+# Persistence + executed aggressive flow для sweep. Один snapshot легко spoof'иться.
+OB_PERSISTENCE_WINDOW_SEC = float(os.getenv("OB_PERSISTENCE_WINDOW_SEC", 3.0))
+OB_PERSISTENCE_MIN_SEC    = float(os.getenv("OB_PERSISTENCE_MIN_SEC", 1.0))
+OB_PERSISTENCE_MIN_SAMPLES = int(os.getenv("OB_PERSISTENCE_MIN_SAMPLES", 5))
+OB_PERSISTENCE_MIN_RATIO  = float(os.getenv("OB_PERSISTENCE_MIN_RATIO", 0.70))
+SWEEP_REQUIRE_TRADE_FLOW  = _env_bool("SWEEP_REQUIRE_TRADE_FLOW", "true")
+TRADE_FLOW_LOOKBACK_SEC   = float(os.getenv("TRADE_FLOW_LOOKBACK_SEC", 3.0))
+TRADE_FLOW_IMBALANCE_MIN  = float(os.getenv("TRADE_FLOW_IMBALANCE_MIN", 20.0))
+TRADE_FLOW_MIN_NOTIONAL   = float(os.getenv("TRADE_FLOW_MIN_NOTIONAL", 50000.0))
+
 
 # ═══════════════════════════════════════════════════════════════
 # ДОПОМІЖНІ (sweep-генератор)
@@ -317,7 +365,9 @@ DB_CONFIG = {
     "database": os.getenv("DB_NAME",     "quant_bot"),
     "user":     os.getenv("DB_USER"),
     "password": os.getenv("DB_PASSWORD"),
+    "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", 5)),
 }
+ENABLE_TRADE_DB_LOG = _env_bool("ENABLE_TRADE_DB_LOG", "true")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -328,6 +378,71 @@ LOG_LEVEL     = os.getenv("LOG_LEVEL",     "DEBUG")
 LOG_FILE      = os.getenv("LOG_FILE",      "logs/bot.log")
 LOG_ROTATION  = os.getenv("LOG_ROTATION",  "1 day")
 LOG_RETENTION = os.getenv("LOG_RETENTION", "30 days")
+
+
+def _validate_active_settings() -> None:
+    """Fail fast on unsafe values instead of silently weakening safeguards."""
+    if not 0 < RISK_PER_TRADE_PCT <= 0.02:
+        raise ValueError("RISK_PER_TRADE_PCT має бути в межах (0, 0.02]")
+    if not 0 < MAX_DAILY_LOSS_PCT <= 0.10:
+        raise ValueError("MAX_DAILY_LOSS_PCT має бути в межах (0, 0.10]")
+    if not 0 <= BYBIT_LEVERAGE <= 100:
+        raise ValueError("BYBIT_LEVERAGE має бути 0 (не змінювати) або в межах 1..100")
+    if MAX_NOTIONAL_EQUITY_MULT < 0:
+        raise ValueError("MAX_NOTIONAL_EQUITY_MULT має бути >= 0")
+    if not 0 <= TRADE_HOUR_START < TRADE_HOUR_END <= 24:
+        raise ValueError("Торгове вікно має задовольняти 0 <= START < END <= 24")
+    if not 0.25 <= OB_PERSISTENCE_MIN_SEC <= OB_PERSISTENCE_WINDOW_SEC <= 10:
+        raise ValueError("Некоректне OB persistence-вікно")
+    if OB_PERSISTENCE_MIN_SAMPLES < 2:
+        raise ValueError("OB_PERSISTENCE_MIN_SAMPLES має бути >= 2")
+    if not 0.5 <= OB_PERSISTENCE_MIN_RATIO <= 1.0:
+        raise ValueError("OB_PERSISTENCE_MIN_RATIO має бути в межах [0.5, 1]")
+    if TRADE_FLOW_LOOKBACK_SEC <= 0 or TRADE_FLOW_MIN_NOTIONAL <= 0:
+        raise ValueError("Trade-flow lookback/notional мають бути > 0")
+    if not 0 < TRADE_FLOW_IMBALANCE_MIN <= 100:
+        raise ValueError("TRADE_FLOW_IMBALANCE_MIN має бути в межах (0, 100]")
+    if not 0.5 <= MAKER_ENTRY_TTL_SEC <= 30:
+        raise ValueError("MAKER_ENTRY_TTL_SEC має бути в межах [0.5, 30]")
+    if not 0 < MAX_ENTRY_DRIFT_BPS <= 100:
+        raise ValueError("MAX_ENTRY_DRIFT_BPS має бути в межах (0, 100]")
+    if not 1 <= DB_CONFIG["connect_timeout"] <= 30:
+        raise ValueError("DB_CONNECT_TIMEOUT має бути в межах 1..30")
+
+    allowed_strategies = {"trend", "vwap", "meanrev", "sweep"}
+    priorities = [name.strip().lower() for name in STRATEGY_PRIORITY if name.strip()]
+    if not priorities or len(priorities) != len(set(priorities)):
+        raise ValueError("STRATEGY_PRIORITY порожній або містить дублікати")
+    unknown = set(priorities) - allowed_strategies
+    if unknown:
+        raise ValueError(f"Невідомі стратегії в STRATEGY_PRIORITY: {sorted(unknown)}")
+
+    for symbol, cfg in SYMBOL_CONFIG.items():
+        confirmations = int(cfg.get("min_confirmations", 2))
+        if confirmations != 2:
+            raise ValueError(
+                f"{symbol}: SWEEP_MIN_CONFIRMATIONS має бути рівно 2"
+            )
+        mode = str(cfg.get("vwap", {}).get("mode", "session")).lower()
+        if mode not in {"session", "rolling"}:
+            raise ValueError(f"{symbol}: VWAP_MODE має бути session або rolling")
+        supported_tf = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"}
+        for section, field in (("trend", "trend_tf"), ("trend", "entry_tf"),
+                               ("vwap", "tf"), ("meanrev", "tf")):
+            tf = str(cfg.get(section, {}).get(field, "5m"))
+            if tf not in supported_tf:
+                raise ValueError(f"{symbol}: unsupported timeframe {section}.{field}={tf}")
+        mr = cfg.get("meanrev", {})
+        if not 0 < float(mr.get("rsi_oversold", 32)) < 50:
+            raise ValueError(f"{symbol}: MEANREV_RSI_OS має бути між 0 і 50")
+        if not 50 < float(mr.get("rsi_overbought", 68)) < 100:
+            raise ValueError(f"{symbol}: MEANREV_RSI_OB має бути між 50 і 100")
+        for section in ("meanrev", "vwap", "trend"):
+            if float(cfg.get(section, {}).get("min_rr", 0)) <= 0:
+                raise ValueError(f"{symbol}: {section}.min_rr має бути > 0")
+
+
+_validate_active_settings()
 
 
 # ═══════════════════════════════════════════════════════════════

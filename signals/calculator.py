@@ -1,17 +1,11 @@
 """
-КАЛЬКУЛЯТОР РИЗИКУ — маркет ордери з slippage
-===============================================
-Завжди використовуй Decimal для цін і комісій.
-float дає похибку при розрахунку комісій → хибний P&L.
+КАЛЬКУЛЯТОР РИЗИКУ — NET-ризик з комісіями та slippage.
 
-Схема витрат на одну угоду (маркет ордер Bybit):
-  Вхід:  taker 0.055% + slippage BTC 0.03% / SOL 0.05%
-  Вихід: taker 0.055% + slippage BTC 0.03% / SOL 0.05%
-  Разом: BTC ~0.17% / SOL ~0.21% від розміру позиції
-
-  При $25 позиції BTC: $25 × 0.17% = $0.043 за угоду
-  Мінімальний рух для беззбитковості BTC: 0.17% від ціни
-  При BTC $95,000: мінімум $161.5 руху ціни
+Вхід і захисний SL моделюються як taker-виконання зі slippage у
+гірший бік. Limit-TP не має slippage, але для fail-safe RR комісія
+моделюється як taker: triggered limit може одразу забрати ліквідність.
+Фактичний maker-fill лише покращить результат. Усі грошові
+розрахунки виконуються через Decimal.
 """
 
 from decimal import Decimal, ROUND_DOWN
@@ -32,7 +26,7 @@ from config.settings import (
 # ── Константи (тепер із settings/.env, не хардкоди) ────────
 
 BYBIT_TAKER = Decimal(str(BYBIT_TAKER_FEE))   # вхід і SL — маркет (taker)
-BYBIT_MAKER = Decimal(str(BYBIT_MAKER_FEE))   # TP — лімітний (maker)
+BYBIT_MAKER = Decimal(str(BYBIT_MAKER_FEE))   # telemetry/reference
 
 SLIPPAGE = {
     "BTC/USDT:USDT": Decimal(str(BTC_SLIPPAGE_PCT)),
@@ -66,6 +60,10 @@ def calculate_position(
     stop_loss:   Decimal,
     take_profit: Decimal,
     min_rr:      Decimal | None = None,
+    *,
+    max_notional: Decimal | None = None,
+    max_leverage: Decimal | None = None,
+    entry_is_filled: bool = False,
 ) -> dict:
     """
     Розраховує розмір позиції і реальний P&L з комісіями.
@@ -75,17 +73,18 @@ def calculate_position(
     торгує з RR≈0.8-1.0 але високим win-rate. Якщо None — береться
     глобальний MIN_RR (= settings.MIN_RISK_REWARD).
 
-    Алгоритм:
-      1. risk_usdt = deposit × risk_pct          ($500 × 1% = $5)
-      2. sl_distance = |entry - stop_loss|
-      3. qty = risk_usdt / sl_distance            (округлення вниз)
-      4. real_entry = entry ± slippage            (маркет гірша ціна)
-      5. real_exit  = tp/sl ∓ slippage            (маркет гірша ціна)
-      6. fee_in  = qty × real_entry × 0.055%
-      7. fee_out = qty × real_exit  × 0.055%
-      8. net_profit = gross_profit - fee_in - fee_out
-      9. net_loss   = gross_loss   + fee_in + fee_out
-     10. rr = net_profit / net_loss
+    Розмір позиції рахується від NET-збитку на одиницю активу:
+    рух до SL після slippage + taker-комісія входу + taker-комісія
+    SL. Отримана quantity округлюється вниз до qty_step, тому
+    фактичний NET-збиток не може перевищити ``deposit * risk_pct``.
+
+    max_notional обмежує номінал позиції, а max_leverage — номінал
+    до ``deposit * max_leverage``. Обидва аргументи опційні; за замовчуванням
+    поведінка викликів залишається сумісною.
+
+    entry_is_filled=True використовується лише для post-fill safety recheck:
+    ``entry_price`` тоді вже є фактичним fill, тому повторний entry-slippage
+    не додається. Entry fee та adverse slippage захисного SL лишаються.
 
     Повертає dict або {"error": "..."} якщо позиція замала.
     """
@@ -94,40 +93,88 @@ def calculate_position(
     risk_usd = deposit * risk_pct
     rr_floor = Decimal(str(min_rr)) if min_rr is not None else MIN_RR
 
-    sl_dist = abs(entry_price - stop_loss)
-    if sl_dist == 0:
-        return {"error": "SL дорівнює ціні входу"}
-
-    # Розмір позиції в монетах (округлюємо вниз до qty_step)
-    raw_qty  = risk_usd / sl_dist
-    step     = cfg["qty_step"]
-    quantity = (raw_qty // step) * step
-
-    if quantity < cfg["min_qty"]:
-        return {
-            "error": (f"Позиція {quantity} менша за мінімум "
-                      f"{cfg['min_qty']}. "
-                      f"Збільш ризик або зменш SL дистанцію.")
-        }
-
-    pos_value = quantity * entry_price
+    if deposit <= 0 or risk_pct <= 0 or risk_usd <= 0:
+        return {"error": "Депозит і risk_pct мають бути додатними"}
+    if entry_price <= 0 or stop_loss <= 0 or take_profit <= 0:
+        return {"error": "Ціни entry, SL і TP мають бути додатними"}
 
     # Реальні ціни. Вхід і SL — маркет (сліпедж у гірший бік).
     # TP — ЛІМІТНИЙ ордер: виконується рівно за своєю ціною, БЕЗ сліпеджу.
     is_long = entry_price < take_profit
 
+    if is_long and stop_loss >= entry_price:
+        return {"error": "Для LONG стоп має бути нижче ціни входу"}
+    if not is_long and (take_profit >= entry_price or stop_loss <= entry_price):
+        return {"error": "Для SHORT TP має бути нижче, а SL — вище ціни входу"}
+
     if is_long:
-        real_entry    = entry_price  * (1 + slip)   # купуємо дорожче
+        real_entry    = entry_price if entry_is_filled else entry_price * (1 + slip)
         real_exit_tp  = take_profit                 # ліміт = точна ціна
         real_exit_sl  = stop_loss    * (1 - slip)
     else:
-        real_entry    = entry_price  * (1 - slip)   # продаємо дешевше
+        real_entry    = entry_price if entry_is_filled else entry_price * (1 - slip)
         real_exit_tp  = take_profit                 # ліміт = точна ціна
         real_exit_sl  = stop_loss    * (1 + slip)
 
-    # Комісії: вхід taker, TP maker (ліміт), SL taker
+    # NET-збиток на 1 монету вже містить slippage в цінах
+    # виконання і обидві taker-комісії. Саме від нього, а не від
+    # gross SL-дистанції, рахуємо безпечну quantity.
+    if is_long:
+        gross_loss_per_unit = real_entry - real_exit_sl
+    else:
+        gross_loss_per_unit = real_exit_sl - real_entry
+    loss_per_unit = (
+        gross_loss_per_unit
+        + real_entry * BYBIT_TAKER
+        + real_exit_sl * BYBIT_TAKER
+    )
+    if loss_per_unit <= 0:
+        return {"error": "Неможливо розрахувати додатний NET-ризик"}
+
+    raw_qty = risk_usd / loss_per_unit
+
+    # Опційні жорсткі обмеження експозиції. Ліміт leverage
+    # перетворюється на максимальний номінал від поточного deposit.
+    notional_cap = None
+    if max_notional is not None:
+        max_notional = Decimal(str(max_notional))
+        if max_notional <= 0:
+            return {"error": "max_notional має бути додатним"}
+        notional_cap = max_notional
+    if max_leverage is not None:
+        max_leverage = Decimal(str(max_leverage))
+        if max_leverage <= 0:
+            return {"error": "max_leverage має бути додатним"}
+        leverage_cap = deposit * max_leverage
+        notional_cap = (
+            leverage_cap if notional_cap is None
+            else min(notional_cap, leverage_cap)
+        )
+    if notional_cap is not None:
+        raw_qty = min(raw_qty, notional_cap / entry_price)
+
+    # Округляємо тільки вниз до кроку біржі.
+    step = cfg["qty_step"]
+    quantity = (raw_qty / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+    # Захисна перевірка інваріанта після біржового floor. Decimal-математика
+    # має завжди пройти цю умову; додатковий крок захищає від
+    # майбутніх змін точності/округлення.
+    if quantity * loss_per_unit > risk_usd:
+        quantity -= step
+
+    if quantity < cfg["min_qty"]:
+        return {
+            "error": (f"Позиція {max(quantity, Decimal('0'))} менша за мінімум "
+                      f"{cfg['min_qty']} після NET-risk/notional обмежень.")
+        }
+
+    pos_value = quantity * entry_price
+
+    # Комісії: вхід/SL taker. Triggered limit-TP консервативно теж taker:
+    # біржа не гарантує maker liquidity для такого виконання.
     fee_in     = quantity * real_entry   * BYBIT_TAKER
-    fee_out_tp = quantity * real_exit_tp * BYBIT_MAKER
+    fee_out_tp = quantity * real_exit_tp * BYBIT_TAKER
     fee_out_sl = quantity * real_exit_sl * BYBIT_TAKER
 
     # Gross P&L
@@ -141,10 +188,17 @@ def calculate_position(
     net_profit = gross_profit - fee_in - fee_out_tp
     net_loss   = gross_loss   + fee_in + fee_out_sl
 
+    if net_loss > risk_usd:
+        # Fail closed: ніколи не повертаємо quantity, що перевищує
+        # заданий власником risk budget.
+        return {"error": "NET-ризик після округлення перевищує risk budget"}
+
     rr = net_profit / net_loss if net_loss > 0 else Decimal("0")
 
-    # Мінімальний рух для беззбитку (вхід taker+slip, вихід по TP maker)
-    total_cost_pct  = (BYBIT_TAKER + slip) + BYBIT_MAKER
+    # Мінімальний рух для беззбитку (вхід taker+slip, TP worst-case taker)
+    total_cost_pct  = BYBIT_TAKER + BYBIT_TAKER + (
+        Decimal("0") if entry_is_filled else slip
+    )
     breakeven_price = entry_price * total_cost_pct
 
     result = {
@@ -156,12 +210,16 @@ def calculate_position(
         "take_profit":     take_profit,
         "real_entry":      real_entry.quantize(Decimal("0.01")),
         "fee_total":       (fee_in + fee_out_tp).quantize(Decimal("0.0001")),
-        "slippage_cost":   (pos_value * slip * 2).quantize(Decimal("0.0001")),
+        "slippage_cost":   (
+            pos_value * slip * (Decimal("1") if entry_is_filled else Decimal("2"))
+        ).quantize(Decimal("0.0001")),
         "risk_usdt":       net_loss.quantize(Decimal("0.01")),
         "reward_usdt":     net_profit.quantize(Decimal("0.01")),
         "rr_ratio":        rr.quantize(Decimal("0.01")),
         "rr_ok":           rr >= rr_floor,
         "rr_floor":        rr_floor,
+        "risk_budget":     risk_usd,
+        "max_notional":    notional_cap,
         "breakeven_move":  breakeven_price.quantize(Decimal("0.01")),
         "order_type":      "MARKET",
     }
@@ -193,7 +251,7 @@ def check_daily_limits(
     blocked        = False
     reasons        = []
 
-    if daily_pnl < -max_daily_loss:
+    if daily_pnl <= -max_daily_loss:
         blocked = True
         reasons.append(f"Денний збиток ${abs(daily_pnl):.2f} > ліміт ${max_daily_loss:.2f}")
 

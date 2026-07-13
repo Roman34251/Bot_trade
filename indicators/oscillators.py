@@ -54,10 +54,11 @@ def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     rs = avg_gain / avg_loss.replace(0.0, np.nan)
     out = 100.0 - (100.0 / (1.0 + rs))
 
-    # avg_loss==0 → RSI=100 (тільки зростання); avg_gain==0 → RSI=0
+    # avg_loss==0 → RSI=100 (тільки зростання); avg_gain==0 → RSI=0;
+    # обидва нулі (повністю плаский ринок) → нейтральні 50.
     out = out.where(avg_loss != 0.0, 100.0)
-    out = out.where(avg_gain != 0.0, out)
     out.loc[(avg_gain == 0.0) & (avg_loss != 0.0)] = 0.0
+    out.loc[(avg_gain == 0.0) & (avg_loss == 0.0)] = 50.0
     return out.fillna(50.0)
 
 
@@ -156,24 +157,30 @@ def vwap_rolling(df: pd.DataFrame, window: Optional[int] = None) -> pd.Series:
     tp = (high + low + close) / 3.0
     pv = tp * vol
 
-    if window is None or window <= 0 or window >= len(df):
+    if window is None or window <= 0:
         cum_v = vol.cumsum().replace(0.0, np.nan)
         return (pv.cumsum() / cum_v).fillna(tp)
 
-    roll_v = vol.rolling(window).sum().replace(0.0, np.nan)
-    return (pv.rolling(window).sum() / roll_v).fillna(tp)
+    # min_periods=1 gives a causal cumulative warmup, then a true rolling
+    # window, without changing the already calculated prefix later.
+    roll_v = vol.rolling(window, min_periods=1).sum().replace(0.0, np.nan)
+    return (pv.rolling(window, min_periods=1).sum() / roll_v).fillna(tp)
 
 
 def vwap_bands(
     df: pd.DataFrame,
     window: Optional[int] = None,
     k: float = 2.0,
+    anchor: Optional[str] = None,
 ) -> dict:
     """
-    VWAP ± k·σ, де σ — зважене стандартне відхилення typical_price від VWAP.
+    VWAP ± k·σ, де σ — зважене стандартне відхилення typical_price.
+
+    ``anchor="session"`` скидає кумулятивні суми о 00:00 UTC. Без anchor
+    використовується rolling/cumulative режим, сумісний зі старими викликами.
 
     Логіка σ:
-      var = Σ(vol · (tp - vwap)²) / Σ(vol)   (volume-weighted variance)
+      var = Eᵥ[tp²] - Eᵥ[tp]²               (volume-weighted variance)
       σ   = sqrt(var)
 
     Повертає dict з останніми значеннями + Series:
@@ -191,15 +198,32 @@ def vwap_bands(
     vol = df["volume"].astype(float).clip(lower=0.0)
 
     tp = (high + low + close) / 3.0
-    vwap_s = vwap_rolling(df, window=window)
-
-    diff2 = (tp - vwap_s) ** 2
-    if window is None or window <= 0 or window >= len(df):
-        cum_v = vol.cumsum().replace(0.0, np.nan)
-        var_s = (diff2 * vol).cumsum() / cum_v
+    pv = tp * vol
+    if anchor == "session":
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise ValueError("session VWAP потребує DatetimeIndex")
+        session_index = df.index
+        if session_index.tz is None:
+            session_index = session_index.tz_localize("UTC")
+        else:
+            session_index = session_index.tz_convert("UTC")
+        session = session_index.floor("D")
+        cum_v = vol.groupby(session).cumsum().replace(0.0, np.nan)
+        vwap_s = pv.groupby(session).cumsum() / cum_v
+        second = ((tp ** 2) * vol).groupby(session).cumsum() / cum_v
+        var_s = second - vwap_s ** 2
     else:
-        roll_v = vol.rolling(window).sum().replace(0.0, np.nan)
-        var_s = (diff2 * vol).rolling(window).sum() / roll_v
+        vwap_s = vwap_rolling(df, window=window)
+        if window is None or window <= 0:
+            cum_v = vol.cumsum().replace(0.0, np.nan)
+            second = ((tp ** 2) * vol).cumsum() / cum_v
+            var_s = second - vwap_s ** 2
+        else:
+            roll_v = vol.rolling(window, min_periods=1).sum().replace(0.0, np.nan)
+            second = (
+                ((tp ** 2) * vol).rolling(window, min_periods=1).sum() / roll_v
+            )
+            var_s = second - vwap_s ** 2
 
     sigma_s = np.sqrt(var_s.clip(lower=0.0)).fillna(0.0)
     upper_s = vwap_s + k * sigma_s
@@ -232,11 +256,8 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
       ADX > 25  → сильний тренд            → ризик для mean-reversion,
                                              добре для momentum/breakout
 
-    Повертає pd.Series. На коротких даних — 0 (нейтрально, фільтр не блокує).
+    Повертає causal pd.Series; ранні значення прогріваються поступово.
     """
-    if len(df) < period * 2:
-        return pd.Series(0.0, index=df.index)
-
     high = df["high"].astype(float)
     low = df["low"].astype(float)
     close = df["close"].astype(float)

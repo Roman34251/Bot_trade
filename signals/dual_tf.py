@@ -34,7 +34,7 @@
 
 ЩО ЩЕ МОЖНА ПОКРАЩИТИ:
   • Partial-TP 50% на 2R + перенесення в беззбиток + ATR-трейлінг.
-  • ADX має РОСТИ (adx[-1] > adx[-2]) — трендова сила має посилюватись.
+  • ADX має не згасати у заданому lookback — фільтр увімкнено за замовчуванням.
   • Вхід на 15m (TREND_ENTRY_TF=15m) — менше шуму, чистіші відкати.
   • MTF-momentum: RSI/MACD на 1h у бік тренду як додаткове підтвердження.
 
@@ -73,6 +73,9 @@ def _trend_gate(df_1h: pd.DataFrame, cfg: dict) -> Optional[str]:
     ema_slow = int(cfg.get("ema_slow", 200))
     slope_lb = int(cfg.get("ema_slope_lookback", 5))
     adx_min = float(cfg.get("adx_min", 20))
+    require_adx_rising = bool(cfg.get("require_adx_rising", True))
+    adx_rise_lookback = max(1, int(cfg.get("adx_rise_lookback", 2)))
+    adx_rise_min = float(cfg.get("adx_rise_min", 0.0))
     use_ema_slow = bool(cfg.get("use_ema200_filter", True))
 
     need = (ema_slow if use_ema_slow else ema_mid) + slope_lb + 2
@@ -91,9 +94,14 @@ def _trend_gate(df_1h: pd.DataFrame, cfg: dict) -> Optional[str]:
     mid_now = float(e_mid.iloc[-1])
     mid_prev = float(e_mid.iloc[-1 - slope_lb])
 
-    adx_val = float(adx(df_1h, period=int(cfg.get("adx_period", 14))).iloc[-1])
+    adx_s = adx(df_1h, period=int(cfg.get("adx_period", 14)))
+    adx_val = float(adx_s.iloc[-1])
     if adx_val < adx_min:
         return None  # боковик / слабкий тренд → стоп
+    if require_adx_rising:
+        adx_prev = float(adx_s.iloc[-1 - adx_rise_lookback])
+        if adx_val < adx_prev + adx_rise_min:
+            return None  # сила тренду згасає — не наздоганяємо пізній рух
 
     long_ok = (f > m) and (price > m) and (mid_now > mid_prev)
     short_ok = (f < m) and (price < m) and (mid_now < mid_prev)
@@ -135,6 +143,7 @@ def generate_trend_signal(dfs: dict, symbol: str) -> Optional[dict]:
     rsi_period = int(tc.get("rsi_period", 14))
     min_rr = float(tc.get("min_rr", 1.7))
     min_sl_pct = float(tc.get("min_sl_pct", 0.0018))
+    require_intact_pullback = bool(tc.get("require_intact_pullback", True))
 
     if not _validate(df_1h, ema_mid + 10) or not _validate(df_e, ema_mid + pullback_lb + 2):
         return None
@@ -162,13 +171,21 @@ def generate_trend_signal(dfs: dict, symbol: str) -> Optional[dict]:
     lows = df_e["low"].astype(float).iloc[-pullback_lb:]
     highs = df_e["high"].astype(float).iloc[-pullback_lb:]
     ef_win = e_fast.iloc[-pullback_lb:]
+    em_win = e_mid.iloc[-pullback_lb:]
+    close_win = close_e.iloc[-pullback_lb:]
 
     rsi_val = float(rsi(close_e, period=rsi_period).iloc[-1]) if use_rsi else None
 
     if direction == "long":
         dipped = bool((lows <= ef_win).any())            # торкнувся зони EMA20
         confirm = price > ef and price > o               # close назад над EMA20 + бичача
-        not_broken = price > (em - max_break_atr * atr_e)  # структура ціла
+        # Якщо структура ламалась на будь-якому закритому барі відкату,
+        # пізній reclaim не перетворює цей setup назад на якісний pullback.
+        not_broken = (
+            bool((close_win > (em_win - max_break_atr * atr_e)).all())
+            if require_intact_pullback
+            else price > (em - max_break_atr * atr_e)
+        )
         not_extended = price < (ef + extension_atr * atr_e)  # не задерта
         rsi_ok = (rsi_val is None) or (rsi_val > 45)
         if not (dipped and confirm and not_broken and not_extended and rsi_ok):
@@ -185,7 +202,11 @@ def generate_trend_signal(dfs: dict, symbol: str) -> Optional[dict]:
     else:
         popped = bool((highs >= ef_win).any())           # торкнувся зони EMA20 зверху
         confirm = price < ef and price < o               # close назад під EMA20 + ведмежа
-        not_broken = price < (em + max_break_atr * atr_e)
+        not_broken = (
+            bool((close_win < (em_win + max_break_atr * atr_e)).all())
+            if require_intact_pullback
+            else price < (em + max_break_atr * atr_e)
+        )
         not_extended = price > (ef - extension_atr * atr_e)
         rsi_ok = (rsi_val is None) or (rsi_val < 55)
         if not (popped and confirm and not_broken and not_extended and rsi_ok):

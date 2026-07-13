@@ -37,7 +37,7 @@ except ImportError:
     sys.exit(1)
 
 from config.settings import (
-    SYMBOL_CONFIG, DEPOSIT_USDT, RISK_PER_TRADE_PCT,
+    SYMBOL_CONFIG, DEPOSIT_USDT, RISK_PER_TRADE_PCT, FTA_TF,
 )
 try:
     from config.settings import STRATEGY_PRIORITY
@@ -65,6 +65,18 @@ except Exception:
 
 SYMBOL = "BTC/USDT:USDT"
 
+TF_DURATIONS = {
+    "1m": pd.Timedelta(minutes=1),
+    "3m": pd.Timedelta(minutes=3),
+    "5m": pd.Timedelta(minutes=5),
+    "15m": pd.Timedelta(minutes=15),
+    "30m": pd.Timedelta(minutes=30),
+    "1h": pd.Timedelta(hours=1),
+    "2h": pd.Timedelta(hours=2),
+    "4h": pd.Timedelta(hours=4),
+    "1d": pd.Timedelta(days=1),
+}
+
 
 def fetch(ex, tf, limit=250):
     raw = ex.fetch_ohlcv(SYMBOL, tf, limit=limit)
@@ -73,7 +85,13 @@ def fetch(ex, tf, limit=250):
     df.set_index("ts", inplace=True)
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = df[c].astype(float)
-    return df
+    duration = TF_DURATIONS.get(tf)
+    if duration is None:
+        raise ValueError(f"Невідомий timeframe: {tf}")
+    now = pd.Timestamp.now(tz="UTC")
+    # Bybit REST зазвичай повертає forming candle останнім рядком. Діагностика
+    # має бути causal-equivalent live, тому використовує лише вже закриті.
+    return df.loc[(df.index + duration) <= now]
 
 
 def line(txt=""):
@@ -92,11 +110,18 @@ def run_calc(sig):
     return pos
 
 
-def _truncate(dfs, cutoff):
-    """Обрізає всі df до свічок з timestamp <= cutoff (для реплею історії)."""
+def _truncate(dfs, decision_time):
+    """Каузальний зріз: включає лише свічки, закриті до decision_time."""
     out = {}
     for tf, df in dfs.items():
-        out[tf] = None if df is None else df.loc[df.index <= cutoff]
+        if df is None:
+            out[tf] = None
+            continue
+        duration = TF_DURATIONS.get(tf)
+        if duration is None:
+            out[tf] = df.loc[df.index < decision_time]
+        else:
+            out[tf] = df.loc[(df.index + duration) <= decision_time]
     return out
 
 
@@ -123,9 +148,8 @@ def _run_all(dfs, symbol):
 
 def scan_history(dfs, symbol, scan_bars=180):
     """
-    Реплей останніх scan_bars 5m-свічок: скільки разів КОЖНА стратегія дала б
-    сигнал і скільки з них реально відкрились би (net RR ok). Це прямо
-    відповідає на питання «чи давав ринок сетапи цього тижня».
+    Каузальний діагностичний scan останніх scan_bars 5m-свічок. Це НЕ
+    win-rate/backtest: тут немає виходів, one-position, OB та cooldown.
     """
     df5 = dfs.get("5m")
     if df5 is None or len(df5) < scan_bars + 10:
@@ -137,7 +161,7 @@ def scan_history(dfs, symbol, scan_bars=180):
     logger.remove()
     logger.add(sys.stdout, level="WARNING")   # тиша під час реплею
     for cutoff in idxs:
-        sub = _truncate(dfs, cutoff)
+        sub = _truncate(dfs, cutoff + pd.Timedelta(minutes=5))
         for name, sig in _run_all(sub, symbol).items():
             if sig is None:
                 continue
@@ -151,7 +175,7 @@ def scan_history(dfs, symbol, scan_bars=180):
     line(f"\n   За останні {scan_bars} 5m-свічок (~{scan_bars*5/60:.0f} год):")
     names = sorted(set(list(fired) + ["trend", "vwap", "meanrev", "sweep"]))
     for n in names:
-        line(f"     {n:<8}: сигналів {fired.get(n,0):>3}  |  відкрились би {execd.get(n,0):>3}")
+        line(f"     {n:<8}: сигналів {fired.get(n,0):>3}  |  net-RR пройшли {execd.get(n,0):>3}")
     total_exec = sum(execd.values())
     return total_exec
 
@@ -223,11 +247,23 @@ def main():
     ex = ccxt.bybit({"enableRateLimit": True,
                      "options": {"defaultType": "linear", "defaultSubType": "linear"}})
     line("📡 Тягну живі свічки BTC з Bybit...")
-    limits = {"1h": 300, "30m": 400, "5m": 600, "1m": 1000}
+    symbol_cfg = SYMBOL_CONFIG.get(SYMBOL, {})
+    required_tfs = {"1h", "30m", "5m", "1m", FTA_TF}
+    required_tfs.update({
+        str(symbol_cfg.get("trend", {}).get("trend_tf", "1h")),
+        str(symbol_cfg.get("trend", {}).get("entry_tf", "5m")),
+        str(symbol_cfg.get("vwap", {}).get("tf", "5m")),
+        str(symbol_cfg.get("meanrev", {}).get("tf", "5m")),
+    })
+    limits = {
+        "1d": 300, "4h": 300, "2h": 300, "1h": 300,
+        "30m": 400, "15m": 500, "5m": 600, "3m": 800, "1m": 1000,
+    }
+    tf_order = {tf: i for i, tf in enumerate(TF_DURATIONS)}
     dfs = {}
-    for tf in ["1h", "30m", "5m", "1m"]:
+    for tf in sorted(required_tfs, key=lambda x: tf_order.get(x, 999)):
         try:
-            dfs[tf] = fetch(ex, tf, limit=limits[tf])
+            dfs[tf] = fetch(ex, tf, limit=limits.get(tf, 500))
             line(f"   {tf}: {len(dfs[tf])} свічок, остання ціна {dfs[tf]['close'].iloc[-1]:.1f}")
         except Exception as e:
             line(f"   ❌ {tf}: {e}")
@@ -264,8 +300,14 @@ def main():
         df = dfs.get(vw.get("tf", "5m"))
         win = vw.get("window", 96)
         win = int(win) if win else None
-        vb = vwap_bands(df, window=win, k=float(vw.get("k_band", 2.0)))
-        line("\n── VWAP (σ-bands) ──")
+        vw_mode = str(vw.get("mode", "session")).lower()
+        vb = vwap_bands(
+            df,
+            window=win if vw_mode == "rolling" else None,
+            k=float(vw.get("k_band", 2.0)),
+            anchor="session" if vw_mode == "session" else None,
+        )
+        line(f"\n── VWAP (σ-bands, {vw_mode}) ──")
         need = len(df) if df is not None else 0
         line(f"   свічок {need} (потрібно ≥ {(win or 30)+5})")
         line(f"   VWAP = {vb['vwap']:.1f}  дев = {vb['dev_pct']:+.3f}%  "

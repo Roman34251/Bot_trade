@@ -26,6 +26,7 @@ class Database:
             database=DB_CONFIG["database"],
             user=DB_CONFIG["user"],
             password=DB_CONFIG["password"],
+            connect_timeout=DB_CONFIG.get("connect_timeout", 5),
             cursor_factory=psycopg2.extras.RealDictCursor,
             options="-c client_encoding=UTF8",
         )
@@ -225,6 +226,10 @@ class Database:
     # ── УГОДИ ──────────────────────────────────────────────
 
     def save_trade(self, trade: Dict[str, Any]) -> None:
+        payload = dict(trade)
+        payload["entry_reason"] = psycopg2.extras.Json(
+            payload.get("entry_reason") or {}
+        )
         self.cursor.execute(
             """
             INSERT INTO trades
@@ -239,7 +244,7 @@ class Database:
                  %(status)s, %(opened_at)s)
             ON CONFLICT (trade_id) DO NOTHING
             """,
-            trade,
+            payload,
         )
         self.conn.commit()
 
@@ -264,6 +269,37 @@ class Database:
             (exit_price, pnl_usdt, pnl_pct, status, trade_id),
         )
         self.conn.commit()
+
+    def get_latest_open_trade(
+        self,
+        symbol: str,
+        direction: Optional[str] = None,
+        entry_price: Optional[float] = None,
+        quantity: Optional[float] = None,
+        opened_after: Optional[datetime] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Latest persisted live trade for restart reconciliation."""
+        query = """
+            SELECT trade_id, symbol, direction, entry_price, quantity, opened_at
+            FROM trades
+            WHERE symbol = %s AND status = 'open'
+        """
+        params: list[Any] = [symbol]
+        if direction:
+            query += " AND direction = %s"
+            params.append(direction)
+        if entry_price and entry_price > 0:
+            query += " AND ABS(entry_price - %s) <= %s"
+            params.extend([entry_price, entry_price * 0.001])
+        if quantity and quantity > 0:
+            query += " AND ABS(quantity - %s) <= %s"
+            params.extend([quantity, max(1e-9, quantity * 0.01)])
+        if opened_after:
+            query += " AND opened_at >= %s"
+            params.append(opened_after)
+        query += " ORDER BY opened_at DESC LIMIT 1"
+        self.cursor.execute(query, params)
+        return self.cursor.fetchone()
 
     def get_daily_pnl(self, date_str: str) -> float:
         """Повертає P&L за конкретний день."""

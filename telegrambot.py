@@ -2,11 +2,11 @@
 TELEGRAM BOT — керування Bot_trade
 =====================================
 Запуск разом з трейдером:
-  python telegram_bot.py --demo
-  python telegram_bot.py --live
+  python telegrambot.py --demo
+  python telegrambot.py --live
 
 Або окремо (тільки моніторинг без торгівлі):
-  python telegram_bot.py --monitor
+  python telegrambot.py --monitor
 
 Потрібні змінні в .env:
   TELEGRAM_BOT_TOKEN=your_token
@@ -32,6 +32,7 @@ from aiogram.types import (
     Message,
 )
 from loguru import logger
+import pandas as pd
 
 from config.settings import BYBIT_DEMO
 from core.live_trade import LiveTrader
@@ -75,20 +76,19 @@ def _load_tg_config() -> tuple[str, int]:
     admin_raw = os.getenv("TELEGRAM_ADMIN_ID", "0").strip()
 
     if not token:
-        logger.error("❌ TELEGRAM_BOT_TOKEN не знайдено в .env")
-        sys.exit(1)
+        raise RuntimeError("TELEGRAM_BOT_TOKEN не знайдено в .env")
 
     try:
         admin_id = int(admin_raw)
     except ValueError:
-        logger.warning(
-            f"⚠️ TELEGRAM_ADMIN_ID має бути числом, отримано: {admin_raw!r}. "
-            "Бот буде доступний всім."
+        raise RuntimeError(
+            f"TELEGRAM_ADMIN_ID має бути додатним числом, отримано {admin_raw!r}"
         )
-        admin_id = 0
 
-    if admin_id == 0:
-        logger.warning("⚠️ TELEGRAM_ADMIN_ID не встановлено — бот доступний всім!")
+    if admin_id <= 0:
+        raise RuntimeError(
+            "TELEGRAM_ADMIN_ID не встановлено: керування торгівлею fail-closed"
+        )
 
     return token, admin_id
 
@@ -265,6 +265,10 @@ def fmt_trader_state(trader: LiveTrader) -> str:
     if not getattr(trader, "_running", False):
         return "⏹ Не запущений"
 
+    latch = getattr(trader.state, "safety_latch_reason", None)
+    if latch:
+        return f"🆘 Safety latch: {latch}"
+
     paused_event = getattr(trader, "_paused", None)
     if paused_event is not None and not paused_event.is_set():
         return "⏸ На паузі"
@@ -277,6 +281,9 @@ def fmt_status(trader: LiveTrader) -> str:
     mode = "🟡 DEMO" if BYBIT_DEMO else "🔴 LIVE"
     running = fmt_trader_state(trader)
 
+    recent = list(getattr(s, "recent_outcomes", []))[-10:]
+    recent_wr = f"{sum(recent) / len(recent) * 100:.1f}%" if recent else "н/д"
+
     lines = [
         "*📊 СТАТУС ТРЕЙДЕРА*",
         "",
@@ -287,6 +294,7 @@ def fmt_status(trader: LiveTrader) -> str:
         f"📅 Денний P&L: `${fmt_num(s.daily_pnl, 2, signed=True)}`",
         f"🔢 Угод сьогодні: `{s.daily_trades}`",
         f"📉 Loss streak: `{s.loss_streak}`",
+        f"🎯 Win-rate останніх `{len(recent)}`: `{recent_wr}`",
     ]
 
     if s.open_trade:
@@ -296,7 +304,10 @@ def fmt_status(trader: LiveTrader) -> str:
 
         lines += [
             "",
-            "*📈 ВІДКРИТА ПОЗИЦІЯ:*",
+            (
+                "*⏳ ПОЗИЦІЯ ЗАКРИТА — ОЧІКУЮ CLOSED-PNL:*"
+                if t.get("close_pending_since") else "*📈 ВІДКРИТА ПОЗИЦІЯ:*"
+            ),
             f"  {t['direction'].upper()} `{t['symbol']}`",
             f"  Entry: `{fmt_price(t.get('entry'), 2)}`",
             f"  TP: `{fmt_price(t.get('tp'), 2)}` | SL: `{fmt_price(t.get('sl'), 2)}`",
@@ -327,6 +338,8 @@ def fmt_pnl(trader: LiveTrader) -> str:
     total = equity - deposit
     total_pct = (total / deposit * 100) if deposit > 0 else 0
     daily_pct = (daily / deposit * 100) if deposit > 0 else 0
+    recent = list(getattr(s, "recent_outcomes", []))[-10:]
+    recent_wr = f"{sum(recent) / len(recent) * 100:.1f}%" if recent else "н/д"
 
     emoji_total = "📈" if total >= 0 else "📉"
     emoji_daily = "✅" if daily >= 0 else "❌"
@@ -342,6 +355,7 @@ def fmt_pnl(trader: LiveTrader) -> str:
         "",
         f"Угод сьогодні: `{s.daily_trades}`",
         f"Loss streak:   `{s.loss_streak}`",
+        f"Win-rate {len(recent)}: `{recent_wr}`",
         "",
         f"_Оновлено: {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC_",
     ])
@@ -458,7 +472,10 @@ def fmt_diagnostic(trader: LiveTrader, scan_bars: int = _DIAG_BARS) -> str:
     щоб не блокувати торговий цикл.
     """
     get = trader._get_df
-    dfs = {tf: get(_DIAG_SYMBOL, tf) for tf in ["1h", "30m", "5m", "1m"]}
+    dfs = {
+        tf: get(_DIAG_SYMBOL, tf, closed_only=True)
+        for tf in trader._required_timeframes()
+    }
     df5 = dfs.get("5m")
     if df5 is None or len(df5) < 30:
         return "*🔬 ДІАГНОСТИКА*\n\n_Дані ще вантажаться (5m свічок мало). Зачекай кілька хв._"
@@ -542,6 +559,7 @@ def fmt_diagnostic(trader: LiveTrader, scan_bars: int = _DIAG_BARS) -> str:
         L.append(
             f"  сигналів `{es.get('signals', 0)}` → зарізано: "
             f"стіна `{es.get('wall_blocked', 0)}` · OB-напрям `{es.get('obdir_blocked', 0)}` · "
+            f"flow `{es.get('flow_blocked', 0)}` · dedup `{es.get('dedup_blocked', 0)}` · "
             f"калькулятор `{es.get('calc_rejected', 0)}`"
         )
         L.append(
@@ -550,6 +568,16 @@ def fmt_diagnostic(trader: LiveTrader, scan_bars: int = _DIAG_BARS) -> str:
         )
         if es.get("last_reject"):
             L.append(f"  ⚠ остання відмова біржі: `{str(es['last_reject'])[:90]}`")
+        execution = es.get("last_execution")
+        if execution:
+            slip = execution.get("slippage_signal_bps")
+            maker_pct = float(execution.get("maker_pct") or 0.0) * 100
+            slip_text = f"{float(slip):+.2f} bps" if slip is not None else "н/д"
+            L.append(
+                f"  останнє виконання: `{execution.get('filled_qty', 0)}` / "
+                f"`{execution.get('requested_qty', 0)}` @ `{float(execution.get('entry_vwap') or 0):.2f}` · "
+                f"slippage `{slip_text}` · maker `{maker_pct:.0f}%`"
+            )
     L.append("")
 
     mr = cfg.get("meanrev", {})
@@ -563,9 +591,15 @@ def fmt_diagnostic(trader: LiveTrader, scan_bars: int = _DIAG_BARS) -> str:
     vw = cfg.get("vwap", {})
     if vw.get("enabled"):
         win = vw.get("window", 96); win = int(win) if win else None
-        vb = vwap_bands(df5, window=win, k=float(vw.get("k_band", 2.0)))
+        vw_mode = str(vw.get("mode", "session")).lower()
+        vb = vwap_bands(
+            df5,
+            window=win if vw_mode == "rolling" else None,
+            k=float(vw.get("k_band", 2.0)),
+            anchor="session" if vw_mode == "session" else None,
+        )
         ok = "✅" if abs(vb["dev_pct"]) >= float(vw.get("min_dev_pct", 0)) else "❌"
-        L.append(f"*VWAP* {ok}  дев `{vb['dev_pct']:+.2f}%`≥{vw.get('min_dev_pct')} "
+        L.append(f"*VWAP {vw_mode}* {ok}  дев `{vb['dev_pct']:+.2f}%`≥{vw.get('min_dev_pct')} "
                  f"смуги `{vb['lower']:.0f}..{vb['upper']:.0f}`")
 
     tc = cfg.get("trend", {})
@@ -589,7 +623,19 @@ def fmt_diagnostic(trader: LiveTrader, scan_bars: int = _DIAG_BARS) -> str:
     fired, execd = {}, {}
     if n > 20:
         for cutoff in df5.index[-n:]:
-            sub = {tf: (None if d is None else d.loc[d.index <= cutoff]) for tf, d in dfs.items()}
+            decision = cutoff + pd.Timedelta(minutes=5)
+            durations = {
+                "1m": pd.Timedelta(minutes=1), "5m": pd.Timedelta(minutes=5),
+                "15m": pd.Timedelta(minutes=15), "30m": pd.Timedelta(minutes=30),
+                "1h": pd.Timedelta(hours=1),
+            }
+            sub = {
+                tf: (
+                    None if d is None else
+                    d.loc[(d.index + durations.get(tf, pd.Timedelta(0))) <= decision]
+                )
+                for tf, d in dfs.items()
+            }
             for name, sig in _diag_run_all(sub).items():
                 if sig is None:
                     continue
@@ -597,12 +643,12 @@ def fmt_diagnostic(trader: LiveTrader, scan_bars: int = _DIAG_BARS) -> str:
                 pos = _diag_calc(sig)
                 if "error" not in pos and pos.get("rr_ok"):
                     execd[name] = execd.get(name, 0) + 1
-        L += ["", f"*реплей ~{n*5/60:.0f} год (сигнали / відкрились би):*"]
+        L += ["", f"*каузальний scan ~{n*5/60:.0f} год (сигнали / net-RR):*"]
         for name in ["trend", "vwap", "meanrev", "sweep"]:
             L.append(f"  `{name:<8}` {fired.get(name,0):>3} / {execd.get(name,0):>3}")
         total = sum(execd.values())
         if total > 0:
-            L += ["", f"_Ринок дав ~{total} сетапів. Якщо угод нема → виконання_",
+            L += ["", f"_Net-RR пройшли ~{total} кандидатів; це не backtest/win-rate._",
                   "_(фільтр стіни / помилка ордера / бот не перезапущено)._"]
         else:
             L += ["", "_Сетапів мало — тихий ринок або жорсткі пороги._"]
@@ -623,8 +669,6 @@ class TradingBot:
 
     def _is_admin(self, user_id: int) -> bool:
         """Перевіряє чи є користувач адміном."""
-        if self.admin_id == 0:
-            return True
         return user_id == self.admin_id
 
     def _register_handlers(self) -> None:
@@ -747,6 +791,22 @@ class TradingBot:
             await cb.answer("⛔", show_alert=True)
             return
 
+        if not self.trader._running:
+            await cb.answer(
+                "🛑 Трейдер зупинений; потрібен restart сервісу",
+                show_alert=True,
+            )
+            return
+
+        latch = getattr(self.trader.state, "safety_latch_reason", None)
+        if latch:
+            await cb.answer(
+                "🆘 Safety latch не можна зняти кнопкою. Перевір Bybit і "
+                "перезапусти сервіс.",
+                show_alert=True,
+            )
+            return
+
         if self.trader._paused.is_set():
             await cb.answer("▶️ Вже активний", show_alert=True)
             return
@@ -777,40 +837,101 @@ class TradingBot:
 
         self.trader.stop()
 
-        # Закриваємо відкриту позицію якщо є
-        if self.trader.state.open_trade:
-            try:
-                t = self.trader.state.open_trade
-                side = "sell" if t["direction"] == "long" else "buy"
-                self.trader.rest.create_order(
-                    symbol=t["symbol"],
-                    type="market",
-                    side=side,
-                    amount=t["qty"],
-                    params={"reduceOnly": True, "positionIdx": 0},
+        # Дочікуємось завершення in-flight entry lifecycle. Інакше market
+        # entry може підтвердитись уже після нашої фінальної flat-перевірки.
+        async with self.trader._execution_lock:
+            pass
+
+        # Джерело істини — біржа, не in-memory state: невідомий submit або
+        # restart могли залишити реальну позицію, якої state ще не бачить.
+        try:
+            from config.settings import TRADING_PAIRS
+
+            closed_symbols = []
+            close_errors = []
+            async def _active_positions():
+                rows = await asyncio.to_thread(
+                    self.trader.rest.fetch_positions, TRADING_PAIRS
                 )
-                logger.warning(f"🛑 Позицію {t['symbol']} закрито через Telegram СТОП")
-                await self._edit(
-                    cb,
-                    f"🛑 *СТОП ВИКОНАНО*\n\n"
-                    f"✅ Позицію `{t['symbol']}` закрито\n"
-                    f"✅ Бот зупинено\n\n"
-                    f"Для перезапуску: `python main.py --demo`",
-                    None,
+                return [
+                    p for p in rows if float(p.get("contracts", 0) or 0) > 0
+                ]
+
+            async def _close(rows):
+                for p in rows:
+                    symbol = p.get("symbol")
+                    qty = float(p.get("contracts", 0) or 0)
+                    pside = str(p.get("side") or "").lower()
+                    side = "sell" if pside in {"long", "buy"} else "buy"
+                    try:
+                        await asyncio.to_thread(
+                            self.trader.rest.create_order,
+                            symbol=symbol,
+                            type="market",
+                            side=side,
+                            amount=qty,
+                            params={"reduceOnly": True, "positionIdx": 0},
+                        )
+                        closed_symbols.append(str(symbol))
+                    except Exception as e:
+                        close_errors.append(f"{symbol}: {e}")
+
+            # Close visible positions first, then cancel every resting/conditional
+            # order. Repeat once to catch an in-flight entry whose response was lost.
+            await _close(await _active_positions())
+            cancel_errors = []
+            for symbol in TRADING_PAIRS:
+                try:
+                    await asyncio.to_thread(self.trader.rest.cancel_all_orders, symbol)
+                except Exception as e:
+                    cancel_errors.append(f"{symbol}: {e}")
+            await asyncio.sleep(1.0)
+            await _close(await _active_positions())
+            for symbol in TRADING_PAIRS:
+                try:
+                    await asyncio.to_thread(self.trader.rest.cancel_all_orders, symbol)
+                except Exception as e:
+                    cancel_errors.append(f"{symbol}: {e}")
+
+            await asyncio.sleep(0.5)
+            remaining = await _active_positions()
+            open_orders = []
+            for symbol in TRADING_PAIRS:
+                open_orders.extend(
+                    await asyncio.to_thread(self.trader.rest.fetch_open_orders, symbol)
                 )
-            except Exception as e:
-                await self._edit(
-                    cb,
-                    f"🛑 Бот зупинено\n"
-                    f"⚠️ Помилка закриття позиції: `{e}`\n\n"
-                    f"Закрий вручну на Bybit!",
-                    None,
-                )
-        else:
+            if remaining or open_orders or cancel_errors or close_errors:
+                details = []
+                if remaining:
+                    details.append(
+                        "позиції=" + ",".join(str(p.get("symbol")) for p in remaining)
+                    )
+                if open_orders:
+                    details.append(f"open_orders={len(open_orders)}")
+                if cancel_errors:
+                    details.append("cancel_errors=" + " | ".join(cancel_errors))
+                if close_errors:
+                    details.append("close_errors=" + " | ".join(close_errors))
+                raise RuntimeError("; ".join(details))
+
+            closed_text = (
+                "✅ Закрито: " + ", ".join(f"`{s}`" for s in closed_symbols)
+                if closed_symbols else "✅ Відкритих позицій на біржі не було"
+            )
             await self._edit(
                 cb,
-                "🛑 *БОТА ЗУПИНЕНО*\n\n"
-                "Позицій не було. Перезапуск: `python main.py --demo`",
+                "🛑 *СТОП ВИКОНАНО*\n\n"
+                f"{closed_text}\n"
+                "✅ Бот зупинено\n\n"
+                "Для перезапуску: `python telegrambot.py --demo`",
+                None,
+            )
+        except Exception as e:
+            await self._edit(
+                cb,
+                f"🛑 Бот зупинено\n"
+                f"⚠️ Не підтверджено закриття всіх позицій: `{e}`\n\n"
+                "Перевір і закрий вручну на Bybit!",
                 None,
             )
 
@@ -881,7 +1002,7 @@ class TradingBot:
         )
 
     async def notify_trade_closed(self, pnl: float, trade: dict) -> None:
-        emoji = "✅ PROFIT" if pnl > 0 else "❌ LOSS"
+        emoji = "✅ PROFIT" if pnl > 0 else "❌ LOSS" if pnl < 0 else "➖ BREAKEVEN"
         await self.send_alert(
             f"{emoji}\n\n"
             f"`{trade['symbol']}` {trade['direction'].upper()}\n"
@@ -979,20 +1100,38 @@ async def run_monitor_only() -> None:
 def main() -> None:
     setup_logging()
     parser = argparse.ArgumentParser(description="Telegram Bot для Bot_trade")
-    parser.add_argument("--demo", action="store_true", help="Demo + Telegram")
-    parser.add_argument("--live", action="store_true", help="Live + Telegram")
-    parser.add_argument("--monitor", action="store_true", help="Тільки моніторинг")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--demo", action="store_true", help="Demo + Telegram")
+    mode.add_argument("--live", action="store_true", help="Live + Telegram")
+    mode.add_argument("--monitor", action="store_true", help="Тільки моніторинг")
     args = parser.parse_args()
 
     if args.monitor:
         asyncio.run(run_monitor_only())
-    elif args.demo or args.live:
+    elif args.demo:
+        if not BYBIT_DEMO:
+            logger.error(
+                "❌ Відмовлено: --demo, але BYBIT_DEMO=false. "
+                "Live credentials не будуть використані."
+            )
+            return
+        asyncio.run(run_bot_with_trader())
+    elif args.live:
+        if BYBIT_DEMO:
+            logger.error("❌ Відмовлено: --live, але BYBIT_DEMO=true")
+            return
+        if _os.getenv("CONFIRM_LIVE_TRADING", "").strip() != "LIVE":
+            logger.error(
+                "❌ Live-запуск заблоковано. Для свідомого дозволу встанови "
+                "CONFIRM_LIVE_TRADING=LIVE."
+            )
+            return
         asyncio.run(run_bot_with_trader())
     else:
         print("\n📋 Використання:")
-        print("  python telegram_bot.py --demo     # Demo торгівля + Telegram")
-        print("  python telegram_bot.py --live     # Live торгівля + Telegram")
-        print("  python telegram_bot.py --monitor  # Тільки моніторинг\n")
+        print("  python telegrambot.py --demo     # Demo торгівля + Telegram")
+        print("  python telegrambot.py --live     # Live торгівля + Telegram")
+        print("  python telegrambot.py --monitor  # Тільки моніторинг\n")
 
 
 if __name__ == "__main__":

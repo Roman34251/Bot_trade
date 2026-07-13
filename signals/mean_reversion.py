@@ -33,8 +33,8 @@
     → RR помітно вгору (потребує wait/cancel логіки у виконавці).
   • Ширший сигнальний ТФ (15m) — менше шуму, чистіші торкання смуг.
   • Time-stop: закривати угоду, якщо за N свічок ціна не пішла до mid.
-  • RSI-«гачок» (curl-up): вимагати, щоб RSI вже почав розвертатись, а не
-    просто був у зоні (ще один шар підтвердження momentum).
+  • RSI-«гачок» (curl-up) увімкнено за замовчуванням: RSI має вже почати
+    розвертатись після недавнього екстремуму, а не просто бути в зоні.
 
 Вхід: MARKET (на закритті сигнальної свічки). Сигнал-дикт сумісний з
 generate_scalp_signal → live_trade._execute_trade працює без змін.
@@ -59,6 +59,37 @@ def _validate(df: Optional[pd.DataFrame], need: int) -> bool:
         return False
     required = {"open", "high", "low", "close", "volume"}
     return required.issubset(df.columns)
+
+
+def _rsi_reversal_hook(
+    values: pd.Series,
+    direction: str,
+    threshold: float,
+    lookback: int = 3,
+    min_delta: float = 0.0,
+) -> bool:
+    """Підтверджує, що RSI вже повертається з недавнього екстремуму.
+
+    Функція дивиться лише на передані (тобто вже закриті) бари. Для LONG
+    у попередньому вікні мусив бути RSI <= oversold, а останній RSI має
+    зрости щонайменше на ``min_delta``. Для SHORT умови дзеркальні.
+    """
+    lookback = max(1, int(lookback))
+    clean = values.astype(float).dropna()
+    if len(clean) < lookback + 1:
+        return False
+
+    prior = clean.iloc[-(lookback + 1):-1]
+    current = float(clean.iloc[-1])
+    previous = float(clean.iloc[-2])
+
+    if direction == "long":
+        touched_extreme = float(prior.min()) <= threshold
+        return touched_extreme and current >= previous + min_delta
+    if direction == "short":
+        touched_extreme = float(prior.max()) >= threshold
+        return touched_extreme and current <= previous - min_delta
+    return False
 
 
 def htf_trend_direction(
@@ -121,16 +152,23 @@ def generate_meanrev_signal(dfs: dict, symbol: str) -> Optional[dict]:
     tp_target = str(mr.get("tp_target", "mid"))
     sl_atr_buffer = float(mr.get("sl_atr_buffer", 0.6))
     min_width_pct = float(mr.get("min_width_pct", 0.25))
-    use_adx = bool(mr.get("use_adx_filter", False))
+    use_adx = bool(mr.get("use_adx_filter", True))
     adx_max = float(mr.get("adx_max", 35))
     min_rr = float(mr.get("min_rr", 0.85))
     min_sl_pct = float(mr.get("min_sl_pct", 0.003))
     # ⭐ нові фільтри якості (2026-07-08)
     require_reclaim = bool(mr.get("require_reclaim", True))
+    require_rsi_hook = bool(mr.get("require_rsi_hook", True))
+    rsi_hook_lookback = max(1, int(mr.get("rsi_hook_lookback", 3)))
+    # ``rsi_hook_min_delta`` лишаємо як сумісний alias для ранніх конфігів.
+    rsi_hook_min_delta = max(
+        0.0,
+        float(mr.get("rsi_hook_delta", mr.get("rsi_hook_min_delta", 0.0))),
+    )
     use_trend_filter = bool(mr.get("use_trend_filter", True))
     trend_filter_tf = str(mr.get("trend_filter_tf", "1h"))
 
-    need = max(bb_period, rsi_period) + 5
+    need = max(bb_period, rsi_period) + rsi_hook_lookback + 2
     if not _validate(df, need):
         logger.debug(f"{symbol} [meanrev]: недостатньо даних {tf}")
         return None
@@ -175,10 +213,27 @@ def generate_meanrev_signal(dfs: dict, symbol: str) -> Optional[dict]:
     long_touch = low <= lower or price <= lower
     short_touch = high >= upper or price >= upper
 
+    # Один широкий бар, який проколов обидві смуги, не дає однозначного
+    # reversion-напрямку. Старий ``if/elif`` довільно надавав перевагу LONG.
+    if long_touch and short_touch:
+        logger.debug(f"{symbol} [meanrev]: прокол обох BB-смуг — skip")
+        return None
+
+    if require_rsi and require_rsi_hook:
+        long_rsi_ok = _rsi_reversal_hook(
+            rsi_series, "long", rsi_os, rsi_hook_lookback, rsi_hook_min_delta
+        )
+        short_rsi_ok = _rsi_reversal_hook(
+            rsi_series, "short", rsi_ob, rsi_hook_lookback, rsi_hook_min_delta
+        )
+    else:
+        long_rsi_ok = rsi_val <= rsi_os
+        short_rsi_ok = rsi_val >= rsi_ob
+
     direction = None
-    if long_touch and (not require_rsi or rsi_val <= rsi_os):
+    if long_touch and (not require_rsi or long_rsi_ok):
         direction = "long"
-    elif short_touch and (not require_rsi or rsi_val >= rsi_ob):
+    elif short_touch and (not require_rsi or short_rsi_ok):
         direction = "short"
 
     if direction is None:

@@ -29,6 +29,7 @@
      купуємо проти сильного падіння. Це головний фільтр VWAP-reversion:
      у сильному тренді ціна НЕ вертається до VWAP — VWAP стає динамічною
      підтримкою/опором, і фейд тренду = стабільний збиток.
+  5. ⭐ Локальний ADX regime-gate: не фейдимо VWAP у сильному тренді.
 
 ЧОМУ ЦЕ (з дослідження + наша статистика):
   Головна вимога VWAP-σ-reversion — торгувати ЛИШЕ у боковику; у тренді
@@ -53,7 +54,7 @@ from loguru import logger
 
 from config.settings import SYMBOL_CONFIG
 from indicators.range_detector import calculate_atr
-from indicators.oscillators import rsi, vwap_bands
+from indicators.oscillators import adx, rsi, vwap_bands
 from signals.mean_reversion import htf_trend_direction
 
 
@@ -79,6 +80,7 @@ def generate_vwap_signal(dfs: dict, symbol: str) -> Optional[dict]:
     tf = vc.get("tf", "5m")
     df = dfs.get(tf)
 
+    vwap_mode = str(vc.get("mode", "session")).strip().lower()
     window = vc.get("window", 96)
     window = int(window) if window else None
     k_band = float(vc.get("k_band", 2.0))
@@ -93,6 +95,9 @@ def generate_vwap_signal(dfs: dict, symbol: str) -> Optional[dict]:
     min_sl_pct = float(vc.get("min_sl_pct", 0.003))
     # ⭐ нові фільтри якості (2026-07-08)
     require_reversal = bool(vc.get("require_reversal_candle", True))
+    use_adx = bool(vc.get("use_adx_filter", True))
+    adx_period = max(2, int(vc.get("adx_period", 14)))
+    adx_max = float(vc.get("adx_max", 25.0))
     use_trend_filter = bool(vc.get("use_trend_filter", True))
     trend_filter_tf = str(vc.get("trend_filter_tf", "1h"))
 
@@ -108,7 +113,19 @@ def generate_vwap_signal(dfs: dict, symbol: str) -> Optional[dict]:
     if atr <= 0:
         return None
 
-    vb = vwap_bands(df, window=window, k=k_band)
+    if vwap_mode not in ("session", "rolling"):
+        logger.error(f"{symbol} [vwap]: невідомий VWAP_MODE={vwap_mode}")
+        return None
+    try:
+        vb = vwap_bands(
+            df,
+            window=window if vwap_mode == "rolling" else None,
+            k=k_band,
+            anchor="session" if vwap_mode == "session" else None,
+        )
+    except (TypeError, ValueError) as e:
+        logger.error(f"{symbol} [vwap]: некоректний timestamp/index: {e}")
+        return None
     if not vb["valid"] or vb["sigma"] <= 0:
         return None
 
@@ -121,6 +138,14 @@ def generate_vwap_signal(dfs: dict, symbol: str) -> Optional[dict]:
     # Девіація замала → ціль (VWAP) ближче за комісії → пропуск
     if abs(dev_pct) < min_dev_pct:
         return None
+
+    # VWAP fade має перевагу у range-режимі. Високий ADX означає, що
+    # відхилення частіше є продовженням тренду, а не поверненням до VWAP.
+    if use_adx:
+        adx_val = float(adx(df, period=adx_period).iloc[-1])
+        if adx_val > adx_max:
+            logger.debug(f"{symbol} [vwap]: ADX {adx_val:.1f} > {adx_max} (тренд) — skip")
+            return None
 
     rsi_val = float(rsi(close, period=rsi_period).iloc[-1]) if require_rsi else None
 
