@@ -481,7 +481,18 @@ def fmt_diagnostic(trader: LiveTrader, scan_bars: int = _DIAG_BARS) -> str:
         return "*🔬 ДІАГНОСТИКА*\n\n_Дані ще вантажаться (5m свічок мало). Зачекай кілька хв._"
 
     cfg = SYMBOL_CONFIG.get(_DIAG_SYMBOL, {})
-    price = float(df5["close"].iloc[-1])
+    now_ts = datetime.now(timezone.utc).timestamp()
+    ws_at = getattr(trader.state, "ws_msg_at", {}) or {}
+    live_ts = ws_at.get(f"{_DIAG_SYMBOL}_1m")
+    live_row = (getattr(trader.state, "live_candles", {}) or {}).get(
+        f"{_DIAG_SYMBOL}_1m"
+    )
+    live_age = None if live_ts is None else max(0.0, now_ts - live_ts)
+    price = (
+        float(live_row[4])
+        if live_row and live_age is not None and live_age <= 30
+        else float(df5["close"].iloc[-1])
+    )
     L = ["*🔬 ДІАГНОСТИКА*", f"BTC = `{price:.1f}`  |  пріоритет `{','.join(STRATEGY_PRIORITY)}`", ""]
 
     # ── Свіжість даних (КРИТИЧНО: ціна вище — з буферів бота; якщо вони
@@ -493,12 +504,7 @@ def fmt_diagnostic(trader: LiveTrader, scan_bars: int = _DIAG_BARS) -> str:
             return f"{int(sec/60)}хв"
         return f"{sec/3600:.1f}год"
 
-    now_ts = datetime.now(timezone.utc).timestamp()
-
     # LIVE-потік: епоха останнього WS-пуша поточної свічки (здорово ≤3с)
-    ws_at = getattr(trader.state, "ws_msg_at", {}) or {}
-    live_ts = ws_at.get(f"{_DIAG_SYMBOL}_1m")
-    live_age = None if live_ts is None else max(0.0, now_ts - live_ts)
     if live_age is not None and live_age <= 30:
         L.append(f"live-потік: `{_age_str(live_age)}` ✅ (ціна вище — реального часу)")
         live_dead = False
@@ -506,8 +512,11 @@ def fmt_diagnostic(trader: LiveTrader, scan_bars: int = _DIAG_BARS) -> str:
         L.append(f"live-потік: `{'нема' if live_age is None else _age_str(live_age)}` ❌")
         live_dead = True
 
-    # Закриті свічки (вік від СТАРТУ останньої закритої: 1m здорово 60-125с)
-    limits = {"1m": 240, "5m": 900, "1h": 7500}
+    # Вік від START: максимум = тривалість таймфрейму + 3с після close.
+    limits = {
+        tf: LiveTrader._max_closed_candle_age_sec(tf)
+        for tf in ("1m", "5m", "1h")
+    }
     ages, closed_stale = [], False
     for tf in ["1m", "5m", "1h"]:
         d = dfs.get(tf)
@@ -520,6 +529,8 @@ def fmt_diagnostic(trader: LiveTrader, scan_bars: int = _DIAG_BARS) -> str:
         closed_stale = closed_stale or bad
         ages.append(f"{tf} `{_age_str(sec)}`" + (" ❌" if bad else ""))
     L.append("закриті свічки: " + " | ".join(ages))
+    if closed_stale:
+        L.append("режим свічок: `LIVE-ПОМИЛКА` ❌ (REST/WS не дав нову закриту свічку)")
 
     if live_dead and closed_stale:
         L += ["", "🛑 *ДАНІ ЗАМЕРЗЛИ — бот бачить СТАРУ ціну!*",

@@ -209,6 +209,12 @@ class LiveGateTests(unittest.TestCase):
         self.trader._check_daily_reset(now)
         self.assertEqual(self.trader.state.daily_pnl, Decimal("3"))
 
+    def test_closed_candle_age_limit_is_timeframe_plus_three_seconds(self):
+        self.assertEqual(self.trader._max_closed_candle_age_sec("1m"), 63.0)
+        self.assertEqual(self.trader._max_closed_candle_age_sec("5m"), 303.0)
+        self.assertEqual(self.trader._max_closed_candle_age_sec("30m"), 1803.0)
+        self.assertEqual(self.trader._max_closed_candle_age_sec("1h"), 3603.0)
+
 
 if __name__ == "__main__":
     unittest.main()

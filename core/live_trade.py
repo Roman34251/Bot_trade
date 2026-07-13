@@ -184,6 +184,8 @@ class LiveState:
     # last_error, last_error_at}. Показується у /diag — щоб причина обриву
     # була видна одразу, без походу в логи сервера.
     ws_status:    dict = field(default_factory=dict)
+    # key -> actual closed-candle age after a failed REST freshness recovery.
+    candle_freshness_errors: dict = field(default_factory=dict)
 
     # Лічильники ВИКОНАННЯ: де саме «вмирають» сигнали на шляху
     # стратегія → фільтри → калькулятор → біржа. Показуються у /diag,
@@ -1065,8 +1067,7 @@ class LiveTrader:
         # Усі ТФ, що впливають на рішення, повинні мати актуальну закриту свічку.
         for tf in self._required_timeframes():
             candle_age = self._last_candle_age_sec(symbol, tf)
-            tf_sec = self.TIMEFRAME_MS[tf] / 1000
-            max_age = 2 * tf_sec + 60
+            max_age = self._max_closed_candle_age_sec(tf)
             if candle_age is None or candle_age > max_age:
                 logger.warning(
                     f"{symbol}: закриті {tf} дані протухли "
@@ -2700,12 +2701,17 @@ class LiveTrader:
             return None
 
     def _last_candle_age_sec(self, symbol: str, tf: str) -> Optional[float]:
-        """Вік останньої ЗАКРИТОЇ свічки (від її START; для 1m здорово 60-125с)."""
+        """Вік останньої закритої свічки від її START."""
         buf = self.state.candles.get(f"{symbol}_{tf}")
         if not buf:
             return None
         last_ts_ms = float(buf[-1][0])
         return max(0.0, datetime.now(timezone.utc).timestamp() - last_ts_ms / 1000.0)
+
+    @classmethod
+    def _max_closed_candle_age_sec(cls, tf: str) -> float:
+        """A closed candle must arrive no later than 3s after its close."""
+        return cls.TIMEFRAME_MS[tf] / 1000.0 + cls.CANDLE_CLOSE_GRACE_SEC
 
     def _ws_age_sec(self, symbol: str, tf: str) -> Optional[float]:
         """Секунд від останнього live-пуша WS (здорово ≤3с)."""
@@ -2738,43 +2744,56 @@ class LiveTrader:
         self.state.candles[key] = deque(ordered[-300:], maxlen=self.CANDLE_BUFFER)
         logger.debug(f"Backfill {key}: {len(raw)} свічок злито, буфер {len(self.state.candles[key])}")
 
-    # Порог свіжості 1m: закрита свічка стартує на ~60-120с позаду "зараз",
-    # тож здорові дані мають вік < ~180с. 240с = точно щось не так.
-    STALE_1M_SEC    = 240
-    REFRESH_MIN_SEC = 120    # REST-перезавантаження до 1 разу на 2 хв: поки WS
-                             # лежить, дані лишаються торгівельно-придатними
+    CANDLE_CLOSE_GRACE_SEC = 3
+    REFRESH_MIN_SEC = 3      # повторюємо REST на наступному циклі, доки дані старі
     ALERT_MIN_SEC   = 1800   # алерт у TG не частіше, ніж раз на 30 хв
 
     async def _ensure_fresh_data(self) -> None:
         """
-        Якщо 1m свічки протухли (WS мовчить) — перезавантажуємо ВСІ буфери
-        через REST (mainnet) і алертимо в Telegram. Це страховка поверх
-        WS-вотчдогів: бот ніколи більше не «живе» днями на замерзлій ціні.
+        Якщо закрита свічка будь-якого потрібного TF не з'явилась за 3с після
+        close — докачуємо її через REST. Якщо вона лишилась старою, фіксуємо
+        live-помилку, а перевірка сигналу блокує нові входи.
         """
-        worst = 0.0
+        stale: list[tuple[str, str, float | None]] = []
         for symbol in TRADING_PAIRS:
-            age = self._last_candle_age_sec(symbol, "1m")
-            if age is None or age > self.STALE_1M_SEC:
-                worst = max(worst, age or 9e9)
+            for tf in self._required_timeframes():
+                age = self._last_candle_age_sec(symbol, tf)
+                if age is None or age > self._max_closed_candle_age_sec(tf):
+                    stale.append((symbol, tf, age))
 
-        if worst == 0.0:
+        if not stale:
+            self.state.candle_freshness_errors.clear()
             return
 
         now_mono = time.monotonic()
         if now_mono - self._last_data_refresh >= self.REFRESH_MIN_SEC:
             self._last_data_refresh = now_mono
             logger.warning(
-                f"🩹 1m дані протухли ({int(min(worst, 9e8))}с) — "
-                f"перезавантажую свічки через REST"
+                "🩹 Закриті свічки запізнились >3с: "
+                + ", ".join(f"{symbol} {tf}" for symbol, tf, _ in stale)
+                + " — докачую через REST"
             )
-            await self._load_initial_candles()
+            await asyncio.gather(*(
+                asyncio.to_thread(self._backfill_candles, symbol, tf)
+                for symbol, tf, _ in stale
+            ))
+
+        errors = {}
+        for symbol, tf, _ in stale:
+            age = self._last_candle_age_sec(symbol, tf)
+            if age is None or age > self._max_closed_candle_age_sec(tf):
+                errors[f"{symbol}_{tf}"] = age
+        self.state.candle_freshness_errors = errors
+
+        if not errors:
+            return
 
         if now_mono - self._last_stale_alert >= self.ALERT_MIN_SEC:
             self._last_stale_alert = now_mono
             await self._notify(
                 "send_alert",
-                "🩹 *Свічки протухали — перезавантажив через REST.*\n"
-                "Якщо це повторюється часто — перевір мережу сервера.",
+                "❌ *LIVE-ПОМИЛКА: нова закрита свічка не з'явилась за 3с.*\n"
+                "Нові входи заблоковані до відновлення WS/REST даних.",
             )
 
     async def _notify(self, method: str, *args) -> None:
