@@ -1066,12 +1066,11 @@ class LiveTrader:
         """
         # Усі ТФ, що впливають на рішення, повинні мати актуальну закриту свічку.
         for tf in self._required_timeframes():
-            candle_age = self._last_candle_age_sec(symbol, tf)
-            max_age = self._max_closed_candle_age_sec(tf)
-            if candle_age is None or candle_age > max_age:
+            candle_lag = self._closed_candle_lag_sec(symbol, tf)
+            if candle_lag is None or candle_lag > 0:
                 logger.warning(
                     f"{symbol}: закриті {tf} дані протухли "
-                    f"(age={candle_age and int(candle_age)}с > {int(max_age)}с) — skip"
+                    f"(lag={candle_lag if candle_lag is not None else 'нема'}с) — skip"
                 )
                 return None
 
@@ -2708,10 +2707,26 @@ class LiveTrader:
         last_ts_ms = float(buf[-1][0])
         return max(0.0, datetime.now(timezone.utc).timestamp() - last_ts_ms / 1000.0)
 
-    @classmethod
-    def _max_closed_candle_age_sec(cls, tf: str) -> float:
-        """A closed candle must arrive no later than 3s after its close."""
-        return cls.TIMEFRAME_MS[tf] / 1000.0 + cls.CANDLE_CLOSE_GRACE_SEC
+    def _closed_candle_lag_sec(
+        self, symbol: str, tf: str, *, now_ts: float | None = None
+    ) -> Optional[float]:
+        """Відставання від останньої очікуваної закритої свічки.
+
+        Вік від START природно росте від TF до 2×TF і не є затримкою.
+        Перші 3с нового бару даємо біржі на confirm; далі останній START має
+        дорівнювати START щойно закритого бару. 0с = дані актуальні.
+        """
+        buf = self.state.candles.get(f"{symbol}_{tf}")
+        if not buf:
+            return None
+        tf_sec = self.TIMEFRAME_MS[tf] / 1000.0
+        now_ts = datetime.now(timezone.utc).timestamp() if now_ts is None else now_ts
+        current_start = int(now_ts // tf_sec) * tf_sec
+        expected_start = current_start - tf_sec
+        if now_ts - current_start <= self.CANDLE_CLOSE_GRACE_SEC:
+            expected_start -= tf_sec
+        actual_start = float(buf[-1][0]) / 1000.0
+        return max(0.0, expected_start - actual_start)
 
     def _ws_age_sec(self, symbol: str, tf: str) -> Optional[float]:
         """Секунд від останнього live-пуша WS (здорово ≤3с)."""
@@ -2757,9 +2772,9 @@ class LiveTrader:
         stale: list[tuple[str, str, float | None]] = []
         for symbol in TRADING_PAIRS:
             for tf in self._required_timeframes():
-                age = self._last_candle_age_sec(symbol, tf)
-                if age is None or age > self._max_closed_candle_age_sec(tf):
-                    stale.append((symbol, tf, age))
+                lag = self._closed_candle_lag_sec(symbol, tf)
+                if lag is None or lag > 0:
+                    stale.append((symbol, tf, lag))
 
         if not stale:
             self.state.candle_freshness_errors.clear()
@@ -2780,9 +2795,9 @@ class LiveTrader:
 
         errors = {}
         for symbol, tf, _ in stale:
-            age = self._last_candle_age_sec(symbol, tf)
-            if age is None or age > self._max_closed_candle_age_sec(tf):
-                errors[f"{symbol}_{tf}"] = age
+            lag = self._closed_candle_lag_sec(symbol, tf)
+            if lag is None or lag > 0:
+                errors[f"{symbol}_{tf}"] = lag
         self.state.candle_freshness_errors = errors
 
         if not errors:

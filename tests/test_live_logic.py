@@ -209,11 +209,34 @@ class LiveGateTests(unittest.TestCase):
         self.trader._check_daily_reset(now)
         self.assertEqual(self.trader.state.daily_pnl, Decimal("3"))
 
-    def test_closed_candle_age_limit_is_timeframe_plus_three_seconds(self):
-        self.assertEqual(self.trader._max_closed_candle_age_sec("1m"), 63.0)
-        self.assertEqual(self.trader._max_closed_candle_age_sec("5m"), 303.0)
-        self.assertEqual(self.trader._max_closed_candle_age_sec("30m"), 1803.0)
-        self.assertEqual(self.trader._max_closed_candle_age_sec("1h"), 3603.0)
+    def test_closed_candle_freshness_uses_expected_bar_not_age_from_start(self):
+        # At :28 the latest closed 1m candle is naturally 88s old from START,
+        # but it is current and therefore has zero lag.
+        now_ts = 1_800_000_028.0
+        current_start = int(now_ts // 60) * 60
+        self.trader.state.candles[f"{SYMBOL}_1m"] = [
+            [(current_start - 60) * 1000, 1, 1, 1, 1, 1]
+        ]
+        self.assertEqual(
+            self.trader._closed_candle_lag_sec(SYMBOL, "1m", now_ts=now_ts),
+            0.0,
+        )
+
+        # One missing bar is reported as a full 60s lag.
+        self.trader.state.candles[f"{SYMBOL}_1m"] = [
+            [(current_start - 120) * 1000, 1, 1, 1, 1, 1]
+        ]
+        self.assertEqual(
+            self.trader._closed_candle_lag_sec(SYMBOL, "1m", now_ts=now_ts),
+            60.0,
+        )
+
+        # During the first 3s after close, the previous bar is still allowed.
+        boundary_ts = current_start + 2
+        self.assertEqual(
+            self.trader._closed_candle_lag_sec(SYMBOL, "1m", now_ts=boundary_ts),
+            0.0,
+        )
 
 
 if __name__ == "__main__":
