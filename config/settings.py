@@ -290,6 +290,9 @@ COOLDOWN_AFTER_SERIES_MIN  = int(os.getenv("COOLDOWN_AFTER_SERIES_MIN", 45))
 SIGNALS_USE_CLOSED_CANDLES = _env_bool("SIGNALS_USE_CLOSED_CANDLES", "true")
 SIGNAL_DEDUP_ENABLED       = _env_bool("SIGNAL_DEDUP_ENABLED", "true")
 MAX_ENTRY_DRIFT_BPS        = float(os.getenv("MAX_ENTRY_DRIFT_BPS", 12.0))
+DAILY_RISK_SYNC_INTERVAL_SEC = float(os.getenv("DAILY_RISK_SYNC_INTERVAL_SEC", 30.0))
+DAILY_RISK_SYNC_FAILURE_LIMIT = int(os.getenv("DAILY_RISK_SYNC_FAILURE_LIMIT", 3))
+CLOSED_PNL_GRACE_SEC       = float(os.getenv("CLOSED_PNL_GRACE_SEC", 12.0))
 
 # Optional maker-entry. Код підтримує PostOnly + TTL + market fallback, але прапорець
 # слід вмикати лише після demo-forward перевірки fill-rate/adverse selection.
@@ -303,7 +306,7 @@ MAKER_FALLBACK_TO_MARKET = _env_bool("MAKER_FALLBACK_TO_MARKET", "true")
 # ═══════════════════════════════════════════════════════════════
 
 # Фільтри OB (глобальні — діють на ВСІ стратегії; вмикати на жорсткішанні):
-USE_ORDER_BOOK_CONFIRMATION = _env_bool("USE_ORDER_BOOK_CONFIRMATION", "false")
+USE_ORDER_BOOK_CONFIRMATION = _env_bool("USE_ORDER_BOOK_CONFIRMATION", "true")
 USE_ORDER_BOOK_WALL_FILTER  = _env_bool("USE_ORDER_BOOK_WALL_FILTER",  "true")
 
 # ⭐ OB-підтвердження АДРЕСНО для sweep (незалежно від глобального прапорця).
@@ -367,7 +370,7 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD"),
     "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", 5)),
 }
-ENABLE_TRADE_DB_LOG = _env_bool("ENABLE_TRADE_DB_LOG", "true")
+ENABLE_TRADE_DB_LOG = _env_bool("ENABLE_TRADE_DB_LOG", "false")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -406,6 +409,12 @@ def _validate_active_settings() -> None:
         raise ValueError("MAKER_ENTRY_TTL_SEC має бути в межах [0.5, 30]")
     if not 0 < MAX_ENTRY_DRIFT_BPS <= 100:
         raise ValueError("MAX_ENTRY_DRIFT_BPS має бути в межах (0, 100]")
+    if not 5 <= DAILY_RISK_SYNC_INTERVAL_SEC <= 300:
+        raise ValueError("DAILY_RISK_SYNC_INTERVAL_SEC має бути в межах [5, 300]")
+    if not 1 <= DAILY_RISK_SYNC_FAILURE_LIMIT <= 10:
+        raise ValueError("DAILY_RISK_SYNC_FAILURE_LIMIT має бути в межах [1, 10]")
+    if not 2 <= CLOSED_PNL_GRACE_SEC <= 60:
+        raise ValueError("CLOSED_PNL_GRACE_SEC має бути в межах [2, 60]")
     if not 1 <= DB_CONFIG["connect_timeout"] <= 30:
         raise ValueError("DB_CONNECT_TIMEOUT має бути в межах 1..30")
 

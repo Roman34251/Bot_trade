@@ -145,7 +145,8 @@ class LiveGateTests(unittest.TestCase):
                 "updatedTime": "2000",
                 "avgEntryPrice": "100",
                 "avgExitPrice": "102",
-                "qty": "0.4",
+                "qty": "1.0",
+                "closedSize": "0.4",
                 "closedPnl": "0.7",
                 "openFee": "0.01",
                 "closeFee": "0.01",
@@ -154,7 +155,8 @@ class LiveGateTests(unittest.TestCase):
                 "updatedTime": "3000",
                 "avgEntryPrice": "100",
                 "avgExitPrice": "103",
-                "qty": "0.6",
+                "qty": "1.0",
+                "closedSize": "0.6",
                 "closedPnl": "1.7",
                 "openFee": "0.02",
                 "closeFee": "0.02",
@@ -170,6 +172,33 @@ class LiveGateTests(unittest.TestCase):
         self.assertAlmostEqual(result["qty"], 1.0)
         self.assertAlmostEqual(result["pnl"], 2.4)
         self.assertAlmostEqual(result["avg_exit"], 102.6)
+
+    def test_sizing_uses_worst_allowed_fill(self):
+        signal_entry = Decimal("62500")
+        self.assertEqual(
+            self.trader._adverse_sizing_entry(
+                signal_entry, Decimal("62520"), "long", 12
+            ),
+            Decimal("62575.0000"),
+        )
+        self.assertEqual(
+            self.trader._adverse_sizing_entry(
+                signal_entry, Decimal("62480"), "short", 12
+            ),
+            Decimal("62425.0000"),
+        )
+
+    def test_full_tpsl_uses_market_orders(self):
+        self.assertEqual(
+            self.trader._full_tpsl_params(110.0, 95.0),
+            {
+                "takeProfit": 110.0,
+                "stopLoss": 95.0,
+                "tpslMode": "Full",
+                "tpOrderType": "Market",
+                "slOrderType": "Market",
+            },
+        )
 
     def test_safety_latch_cannot_look_like_normal_pause(self):
         self.trader._trip_safety_latch("unknown submit")

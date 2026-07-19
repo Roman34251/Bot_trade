@@ -242,8 +242,18 @@ def fmt_filters(t: dict) -> list[str]:
             f"  OF delta: `{fmt_num(t.get('of_delta'), 0, signed=True)}`",
             f"  CVD: `{t.get('cvd_signal', 'n/a')}` | ok: {fmt_bool(t.get('cvd_ok'))}",
             f"  Volume ok: {fmt_bool(t.get('volume_ok'))}",
-            f"  OB: `{fmt_ob(t.get('ob_imbalance'))}` | confirmed: {fmt_bool(t.get('ob_confirmed'))}",
         ]
+
+    lines.append(
+        f"  OB: `{fmt_ob(t.get('ob_imbalance'))}` | "
+        f"confirmed: {fmt_bool(t.get('ob_confirmed'))} | "
+        f"required: {fmt_bool(t.get('ob_required'))}"
+    )
+    if strat == "sweep" and t.get("trade_flow_direction") is not None:
+        lines.append(
+            f"  Executed flow: `{t.get('trade_flow_direction')}` "
+            f"({fmt_num(t.get('trade_flow_imbalance'), 1, signed=True)}%)"
+        )
 
     # FTA — проблемна зона старшого ТФ (показуємо, лише якщо порахована)
     fta = t.get("fta_price")
@@ -311,7 +321,7 @@ def fmt_status(trader: LiveTrader) -> str:
             f"  {t['direction'].upper()} `{t['symbol']}`",
             f"  Entry: `{fmt_price(t.get('entry'), 2)}`",
             f"  TP: `{fmt_price(t.get('tp'), 2)}` | SL: `{fmt_price(t.get('sl'), 2)}`",
-            f"  R:R: `{fmt_num(t.get('raw_rr'), 2)}`",
+            f"  R:R gross/net: `{fmt_num(t.get('raw_rr'), 2)}` / `{fmt_num(t.get('net_rr'), 2)}`",
             f"  Ризик: `${fmt_num(t.get('risk_usdt'), 2)}` → Мета: `${fmt_num(t.get('reward_usdt'), 2)}`",
             "",
             f"*Стратегія: `{t.get('strategy', t.get('mode', '?'))}`*",
@@ -381,7 +391,7 @@ def fmt_position(trader: LiveTrader) -> str:
         f"Entry:  `{fmt_price(t.get('entry'), 4)}`",
         f"TP:     `{fmt_price(t.get('tp'), 4)}` (+{fmt_pct_distance(t.get('tp'), t.get('entry'))})",
         f"SL:     `{fmt_price(t.get('sl'), 4)}` (-{fmt_pct_distance(t.get('sl'), t.get('entry'))})",
-        f"R:R:    `{fmt_num(t.get('raw_rr'), 2)}`",
+        f"R:R gross/net: `{fmt_num(t.get('raw_rr'), 2)}` / `{fmt_num(t.get('net_rr'), 2)}`",
         "",
         f"Розмір: `{t.get('qty', 'n/a')}`",
         f"Ризик:  `${fmt_num(t.get('risk_usdt'), 2)}`",
@@ -1005,7 +1015,8 @@ class TradingBot:
             f"Entry: `{fmt_price(signal.get('entry'), 4)}`\n"
             f"TP:    `{fmt_price(signal.get('tp'), 4)}`\n"
             f"SL:    `{fmt_price(signal.get('sl'), 4)}`\n"
-            f"R:R:   `{fmt_num(signal.get('raw_rr'), 2)}`\n\n"
+            f"R:R gross/net: `{fmt_num(signal.get('raw_rr'), 2)}` / "
+            f"`{fmt_num(signal.get('net_rr'), 2)}`\n\n"
             f"*Фільтри:*\n{filters}"
         )
 

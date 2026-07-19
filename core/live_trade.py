@@ -55,6 +55,8 @@ from config.settings import (
     TRADE_HOURS_ONLY, TRADE_HOUR_START, TRADE_HOUR_END,
     BYBIT_LEVERAGE, MAX_NOTIONAL_EQUITY_MULT,
     SIGNALS_USE_CLOSED_CANDLES, SIGNAL_DEDUP_ENABLED, MAX_ENTRY_DRIFT_BPS,
+    DAILY_RISK_SYNC_INTERVAL_SEC, DAILY_RISK_SYNC_FAILURE_LIMIT,
+    CLOSED_PNL_GRACE_SEC,
     USE_MAKER_ENTRY, MAKER_ENTRY_TTL_SEC, MAKER_FALLBACK_TO_MARKET,
     OB_PERSISTENCE_WINDOW_SEC, OB_PERSISTENCE_MIN_SEC,
     OB_PERSISTENCE_MIN_SAMPLES, OB_PERSISTENCE_MIN_RATIO,
@@ -267,7 +269,9 @@ class LiveTrader:
         # Тротлінг алертів про відхилені ордери (1 на 10 хв; у лог — все)
         self._last_reject_alert = -1e9
         self._last_daily_risk_sync = -1e9
+        self._daily_risk_sync_failures = 0
         self._entry_block_until = 0.0
+        self._last_ob_debug: dict[str, float] = {}
 
         self.state = LiveState(
             equity  = Decimal(str(self._real_balance)),
@@ -813,7 +817,13 @@ class LiveTrader:
                                     )
                                     history.append(snapshot)
  
-                                logger.debug(f"{symbol} OB [{msg_type}]: {snapshot.summary()}")
+                                # WS може давати десятки delta-повідомлень/с. Одного
+                                # діагностичного snapshot на секунду достатньо, а лог
+                                # більше не розростається до сотень МБ за добу.
+                                now_debug = time.monotonic()
+                                if now_debug - self._last_ob_debug.get(symbol, -1e9) >= 1.0:
+                                    self._last_ob_debug[symbol] = now_debug
+                                    logger.debug(f"{symbol} OB [{msg_type}]: {snapshot.summary()}")
  
                     finally:
                         keepalive.cancel()
@@ -974,7 +984,7 @@ class LiveTrader:
                         self.state.loss_streak = 0
 
                 now_mono = time.monotonic()
-                if now_mono - self._last_daily_risk_sync >= 15.0:
+                if now_mono - self._last_daily_risk_sync >= DAILY_RISK_SYNC_INTERVAL_SEC:
                     try:
                         rows = await asyncio.to_thread(
                             self._fetch_today_closed_pnl_rows
@@ -984,16 +994,29 @@ class LiveTrader:
                                 f"daily history incomplete: {len(rows)} < "
                                 f"{self.state.daily_trades}"
                             )
-                        self._restore_daily_risk_state(rows)
+                        self._restore_daily_risk_state(rows, log_result=False)
                         self._last_daily_risk_sync = now_mono
+                        self._daily_risk_sync_failures = 0
                     except Exception as e:
-                        self._trip_safety_latch("periodic daily risk sync failed")
-                        logger.error(f"Periodic daily risk sync failed: {e}")
-                        await self._notify(
-                            "send_alert",
-                            "🆘 Не вдалося синхронізувати денний PnL; "
-                            "safety latch активний.",
+                        self._last_daily_risk_sync = now_mono
+                        self._daily_risk_sync_failures += 1
+                        self._entry_block_until = max(
+                            self._entry_block_until,
+                            now_mono + DAILY_RISK_SYNC_INTERVAL_SEC,
                         )
+                        logger.warning(
+                            "Periodic daily risk sync failed "
+                            f"({self._daily_risk_sync_failures}/"
+                            f"{DAILY_RISK_SYNC_FAILURE_LIMIT}): {e}"
+                        )
+                        if self._daily_risk_sync_failures >= DAILY_RISK_SYNC_FAILURE_LIMIT:
+                            self._trip_safety_latch("periodic daily risk sync failed")
+                            await self._notify(
+                                "send_alert",
+                                "🆘 Не вдалося синхронізувати денний PnL "
+                                f"{self._daily_risk_sync_failures} рази поспіль; "
+                                "safety latch активний.",
+                            )
                         continue
                 if now_mono < self._entry_block_until:
                     await asyncio.sleep(1)
@@ -1188,6 +1211,7 @@ class LiveTrader:
         need_ob_confirm = USE_ORDER_BOOK_CONFIRMATION or (
             strat == "sweep" and SWEEP_USE_OB_CONFIRM
         )
+        signal["ob_required"] = need_ob_confirm
         need_ob_data = need_ob_confirm or USE_ORDER_BOOK_WALL_FILTER
 
         if ob is None:
@@ -1274,7 +1298,7 @@ class LiveTrader:
         logger.info(
             f"✅ SIGNAL ACCEPTED {direction.upper()} {symbol} | "
             f"OB={ob_direction} imbalance={ob.imbalance:+.1f}% | "
-            f"hard_ob={USE_ORDER_BOOK_CONFIRMATION}"
+            f"hard_ob={need_ob_confirm}"
         )
 
         return self._deduplicate_signal(signal, dfs)
@@ -1466,6 +1490,56 @@ class LiveTrader:
         digest = hashlib.sha1(setup.encode("utf-8")).hexdigest()[:24]
         return f"bt-{digest}{suffix}"[:36]
 
+    @staticmethod
+    def _adverse_sizing_entry(
+        signal_entry: Decimal,
+        actionable_entry: Decimal,
+        direction: str,
+        max_drift_bps: float,
+    ) -> Decimal:
+        """Price used for sizing so every allowed fill remains inside risk budget."""
+        drift = Decimal(str(max_drift_bps)) / Decimal("10000")
+        boundary = signal_entry * (
+            Decimal("1") + drift if direction == "long" else Decimal("1") - drift
+        )
+        return (
+            max(actionable_entry, boundary)
+            if direction == "long"
+            else min(actionable_entry, boundary)
+        )
+
+    @staticmethod
+    def _full_tpsl_params(tp: float, sl: float) -> dict:
+        return {
+            "takeProfit": tp,
+            "stopLoss": sl,
+            "tpslMode": "Full",
+            "tpOrderType": "Market",
+            "slOrderType": "Market",
+        }
+
+    def _set_full_position_protection(self, symbol: str, tp: float, sl: float) -> dict:
+        pybit = getattr(self, "_pybit", None)
+        if pybit is None:
+            raise RuntimeError("pybit session unavailable for position TP/SL")
+        ws_symbol = symbol.replace("/", "").replace(":USDT", "")
+        response = pybit.set_trading_stop(
+            category="linear",
+            symbol=ws_symbol,
+            positionIdx=0,
+            takeProfit=str(tp),
+            stopLoss=str(sl),
+            tpslMode="Full",
+            tpOrderType="Market",
+            slOrderType="Market",
+        )
+        if str(response.get("retCode", 0)) != "0":
+            raise RuntimeError(
+                f"set_trading_stop retCode={response.get('retCode')}: "
+                f"{response.get('retMsg')}"
+            )
+        return response
+
     def _lookup_order_by_link_id(self, symbol: str, order_link_id: str) -> Optional[dict]:
         """Reconcile невизначений submit; не дозволяє другий market-вхід."""
         pybit = getattr(self, "_pybit", None)
@@ -1548,7 +1622,13 @@ class LiveTrader:
             return None
         ws_symbol = symbol.replace("/", "").replace(":USDT", "")
         try:
-            resp = pybit.get_closed_pnl(category="linear", symbol=ws_symbol, limit=50)
+            resp = pybit.get_closed_pnl(
+                category="linear",
+                symbol=ws_symbol,
+                startTime=max(0, opened_at_ms - 5_000),
+                endTime=int(datetime.now(timezone.utc).timestamp() * 1000),
+                limit=50,
+            )
             rows = resp.get("result", {}).get("list", [])
         except Exception as e:
             logger.debug(f"Closed PnL fetch: {e}")
@@ -1557,10 +1637,12 @@ class LiveTrader:
         for row in rows:
             try:
                 ts = int(row.get("updatedTime") or row.get("createdTime") or 0)
-                if ts < opened_at_ms:
+                if ts < opened_at_ms - 5_000:
                     continue
                 row_entry = float(row.get("avgEntryPrice") or 0)
-                row_qty = float(row.get("qty") or row.get("closedSize") or 0)
+                # closedSize є фактично закритою кількістю; qty може бути
+                # початковим розміром позиції для кожного partial-close рядка.
+                row_qty = float(row.get("closedSize") or row.get("qty") or 0)
                 if expected_entry:
                     if row_entry <= 0 or abs(row_entry - expected_entry) / expected_entry > 0.001:
                         continue
@@ -1649,7 +1731,7 @@ class LiveTrader:
             result.extend(resp.get("result", {}).get("list", []))
         return result
 
-    def _restore_daily_risk_state(self, rows: list[dict]) -> None:
+    def _restore_daily_risk_state(self, rows: list[dict], *, log_result: bool = True) -> None:
         parsed = []
         for row in rows:
             try:
@@ -1677,10 +1759,11 @@ class LiveTrader:
                 else:
                     self.state.loss_streak = 0
                     self.state.last_loss_time = None
-        logger.info(
-            f"♻️ Денний risk-state: trades={self.state.daily_trades}, "
-            f"PnL=${self.state.daily_pnl:.2f}, streak={self.state.loss_streak}"
-        )
+        if log_result:
+            logger.info(
+                f"♻️ Денний risk-state: trades={self.state.daily_trades}, "
+                f"PnL=${self.state.daily_pnl:.2f}, streak={self.state.loss_streak}"
+            )
 
     def _restore_recent_outcomes(self, rows: list[dict]) -> None:
         parsed = []
@@ -1861,14 +1944,7 @@ class LiveTrader:
                     "orderLinkId": link_id,
                     "timeInForce": "PostOnly",
                     "postOnly": True,
-                    "takeProfit": tp,
-                    "stopLoss": sl,
-                    # Partial mode on create-order attaches TP/SL to the
-                    # actually filled qty and is required for a Limit TP.
-                    "tpslMode": "Partial",
-                    "tpOrderType": "Limit",
-                    "tpLimitPrice": tp,
-                    "slOrderType": "Market",
+                    **self._full_tpsl_params(tp, sl),
                 },
             )
         except Exception as e:
@@ -2003,11 +2079,23 @@ class LiveTrader:
         signal["pricing_source"] = pricing_source
 
         sig_min_rr = signal.get("min_rr")
+        risk_entry = self._adverse_sizing_entry(
+            signal_entry, entry, direction, MAX_ENTRY_DRIFT_BPS
+        )
+        if direction == "long" and not (sl < risk_entry < tp):
+            self.state.exec_stats["calc_rejected"] += 1
+            logger.info(f"{symbol}: worst-case LONG fill уже поза SL/TP — skip")
+            return
+        if direction == "short" and not (tp < risk_entry < sl):
+            self.state.exec_stats["calc_rejected"] += 1
+            logger.info(f"{symbol}: worst-case SHORT fill уже поза TP/SL — skip")
+            return
+        signal["risk_sizing_entry"] = float(risk_entry)
         pos = calculate_position(
             symbol      = symbol,
             deposit     = self.state.equity,
             risk_pct    = Decimal(str(RISK_PER_TRADE_PCT)),
-            entry_price = entry,
+            entry_price = risk_entry,
             stop_loss   = sl,
             take_profit = tp,
             min_rr      = Decimal(str(sig_min_rr)) if sig_min_rr is not None else None,
@@ -2087,14 +2175,7 @@ class LiveTrader:
                     params={
                         "positionIdx": 0,
                         "orderLinkId": order_link_id,
-                        "takeProfit": float(tp),
-                        "stopLoss": float(sl),
-                        # Full supports Market TP/SL only. Partial is the
-                        # documented create-order mode for Limit TP.
-                        "tpslMode": "Partial",
-                        "tpOrderType": "Limit",
-                        "tpLimitPrice": float(tp),
-                        "slOrderType": "Market",
+                        **self._full_tpsl_params(float(tp), float(sl)),
                     },
                 )
                 tpsl_attached = True
@@ -2159,6 +2240,8 @@ class LiveTrader:
 
         # Шлях 2 (fallback): чистий вхід + окремі TP/SL з коректними v5-параметрами
         if order is None:
+            fallback_link = self._order_link_id(signal, "-f")
+            order_link_id = fallback_link
             try:
                 order = await asyncio.to_thread(
                     self.rest.create_order,
@@ -2168,11 +2251,10 @@ class LiveTrader:
                     amount=qty,
                     params={
                         "positionIdx": 0,
-                        "orderLinkId": self._order_link_id(signal, "-f"),
+                        "orderLinkId": fallback_link,
                     },
                 )
             except Exception as e:
-                fallback_link = self._order_link_id(signal, "-f")
                 if isinstance(e, (ccxt.NetworkError, ccxt.RequestTimeout, ccxt.ExchangeNotAvailable)):
                     recovered = None
                     for _ in range(4):
@@ -2321,6 +2403,22 @@ class LiveTrader:
             )
 
             if not tpsl_attached:
+                try:
+                    await asyncio.to_thread(
+                        self._set_full_position_protection,
+                        symbol,
+                        float(tp),
+                        float(sl),
+                    )
+                    tpsl_attached = True
+                    logger.info("✅ Full position TP/SL встановлено через trading-stop")
+                except Exception as protection_error:
+                    logger.warning(
+                        "Full position TP/SL не встановлено: "
+                        f"{protection_error}; пробую окремі reduce-only ордери"
+                    )
+
+            if not tpsl_attached:
                 # TP: reduceOnly limit
                 await asyncio.to_thread(
                     self.rest.create_order,
@@ -2363,6 +2461,7 @@ class LiveTrader:
                 "opened_at":   opened_at,
                 "risk_usdt":   float(pos["risk_usdt"]) * fill_ratio,
                 "reward_usdt": float(pos["reward_usdt"]) * fill_ratio,
+                "net_rr":      float(pos["rr_ratio"]),
                 "execution":   execution_meta,
                 "ob_imbalance": signal.get("ob_imbalance", 0),
                 "mode":        signal.get("mode", "unknown"),
@@ -2371,6 +2470,7 @@ class LiveTrader:
                 "volume_ok":    signal.get("volume_ok"),
                 "ob_direction": signal.get("ob_direction"),
                 "ob_confirmed": signal.get("ob_confirmed"),
+                "ob_required":  signal.get("ob_required", False),
                 "ob_stale":     signal.get("ob_stale", False),
                 "signal_key":    signal.get("signal_key"),
                 "trade_flow_direction": signal.get("trade_flow_direction"),
@@ -2420,7 +2520,8 @@ class LiveTrader:
             logger.error(f"❌ Помилка після входу (TP/SL/запис): {e} — екстрено закриваю позицію")
             await self._notify(
                 "send_alert",
-                f"⚠️ *Позиція відкрилась, але TP/SL не виставились — закриваю!*\n`{e}`",
+                "⚠️ *Позиція відкрилась, але post-fill перевірка або "
+                f"встановлення захисту не завершилися — закриваю!*\n`{e}`",
             )
 
             active = []
@@ -2492,6 +2593,7 @@ class LiveTrader:
                 "strategy": signal.get("strategy", signal.get("mode", "unknown")),
                 "signal_key": signal.get("signal_key"),
                 "raw_rr": signal.get("raw_rr"),
+                "net_rr": float(pos.get("rr_ratio") or 0),
                 "emergency_close": True,
                 "emergency_reason": str(e)[:160],
             }
@@ -2578,7 +2680,9 @@ class LiveTrader:
         try:
             opened_ms = int(trade["opened_at"].timestamp() * 1000)
             closed = None
-            for _ in range(4):
+            trade.setdefault("close_pending_since", datetime.now(timezone.utc))
+            deadline = time.monotonic() + CLOSED_PNL_GRACE_SEC
+            while True:
                 closed = await asyncio.to_thread(
                     self._fetch_closed_pnl,
                     trade["symbol"],
@@ -2588,7 +2692,10 @@ class LiveTrader:
                 )
                 if closed is not None:
                     break
-                await asyncio.sleep(0.5)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(1.0, remaining))
 
             if closed is not None:
                 pnl = float(closed["pnl"])
@@ -2598,7 +2705,6 @@ class LiveTrader:
                 # Execution history does not reliably expose reduceOnly or a
                 # complete realized PnL. Keep the trade in closing-pending and
                 # retry on the next monitor cycle; never invent or lose PnL.
-                trade.setdefault("close_pending_since", datetime.now(timezone.utc))
                 if not trade.get("close_pending_alerted"):
                     trade["close_pending_alerted"] = True
                     await self._notify(

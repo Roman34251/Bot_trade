@@ -632,6 +632,8 @@ def generate_scalp_signal(
         "confirmations": confirmations,
         "of_delta": of["delta"],
         "cvd_signal": cvd_sig,
+        "cvd_ok": cvd_ok,
+        "volume_ok": volume_ok,
         "sweep_extreme": sweep_extreme,
         "range": range_data,
         "order_type": "MARKET",
